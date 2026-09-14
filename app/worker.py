@@ -3787,6 +3787,18 @@ if __name__ == '__main__':
         scheduler.add_job(_scheduled_remote_gracenote_refresh, 'interval', hours=24,
                           id='gracenote_remote_refresh', max_instances=1, coalesce=True)
 
+        def _scheduled_remote_gracenote_exclusions_refresh():
+            from app.gracenote_map import fetch_remote_gracenote_exclusions
+            with flask_app.app_context():
+                from app.models import AppSettings
+                url = AppSettings.get().effective_gracenote_exclusions_url()
+            ok, msg = fetch_remote_gracenote_exclusions(url)
+            if not ok:
+                logger.warning('[gracenote-exclusions] scheduled remote refresh failed: %s', msg)
+
+        scheduler.add_job(_scheduled_remote_gracenote_exclusions_refresh, 'interval', hours=24,
+                          id='gracenote_exclusions_remote_refresh', max_instances=1, coalesce=True)
+
         def _scheduled_tvtv_cache_refresh() -> str:
             try:
                 r = redis.from_url(flask_app.config['REDIS_URL'])
@@ -4010,6 +4022,17 @@ if __name__ == '__main__':
                     logger.warning('[gracenote-map] startup remote fetch failed: %s', msg)
             except Exception:
                 logger.exception('[gracenote-map] startup remote fetch error')
+
+            try:
+                from app.gracenote_map import fetch_remote_gracenote_exclusions
+                url = AppSettings.get().effective_gracenote_exclusions_url()
+                ok, msg = fetch_remote_gracenote_exclusions(url)
+                if ok:
+                    logger.info('[gracenote-exclusions] startup remote fetch: %s', msg)
+                else:
+                    logger.warning('[gracenote-exclusions] startup remote fetch failed: %s', msg)
+            except Exception:
+                logger.exception('[gracenote-exclusions] startup remote fetch error')
 
         while True:
             time.sleep(3600)
