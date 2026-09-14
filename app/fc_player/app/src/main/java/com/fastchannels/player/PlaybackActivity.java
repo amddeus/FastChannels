@@ -3,6 +3,8 @@ package com.fastchannels.player;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.WindowManager;
 
@@ -41,6 +43,13 @@ import androidx.media3.ui.PlayerView;
 @UnstableApi
 public class PlaybackActivity extends Activity {
     private static final String TAG = "FCPlayer.Playback";
+    // Deliberately separate from TAG: a real uncaught crash (see the UncaughtExceptionHandler
+    // in onCreate) and a Media3-handled onPlayerError are different severities, and
+    // fc_player_bridge.check_playback_errors() needs a reliable tag to tell them apart —
+    // confirmed live 2026-09-14 that logging both under TAG made a real forced crash
+    // (`adb shell am crash`) get classified as a mere "playback error" WARNING instead of a
+    // CRASHED ERROR, since the server-side classifier only had the tag to go on.
+    private static final String TAG_CRASH = "FCPlayer.Crash";
 
     static final String EXTRA_STREAM_URL = "stream_url";
     static final String EXTRA_TITLE = "title";
@@ -51,14 +60,52 @@ public class PlaybackActivity extends Activity {
     static final String EXTRA_CHANNEL_KEY = "channel_key";
     static final String COMMAND_WARM_STOP = "warm_stop";
 
+    // Confirmed live 2026-09-14 against a real Vidaa DRM channel: Media3 can hit a fatal
+    // internal error (e.g. androidx/media#2440-style SampleQueue/Allocation NPEs) purely from
+    // a long-running *live* DASH manifest refreshing under an active renderer read — nothing
+    // to do with entitlement or license validity, and calling player.prepare() again recovers
+    // cleanly (it rebuilds the renderers/sample queues from the still-valid MediaItem/Timeline).
+    // Retrying a bounded number of times before giving up turns this from a full session-ending
+    // exit-to-home (indistinguishable from "the app crashed" to a remote user) into something
+    // invisible. Bounded + reset-on-recovery so a channel that's genuinely dead (bad entitlement,
+    // 404 manifest) still gives up quickly instead of hammering the license server in a loop.
+    private static final int MAX_RETRIES = 3;
+    private static final long RETRY_DELAY_MS = 2000;
+    private static final long RETRY_RESET_AFTER_MS = 60_000;
+
     private ExoPlayer player;
     private DefaultTrackSelector trackSelector;
     private MediaSession mediaSession;
     private String activeChannelKey;
+    private final Handler retryHandler = new Handler(Looper.getMainLooper());
+    private final Runnable resetRetryCount = () -> retryCount = 0;
+    private int retryCount = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // onPlayerError only ever fires for errors Media3's own internal playback thread
+        // catches and wraps into a PlaybackException (confirmed live 2026-09-14 — that's
+        // ExoPlayerImplInternal's own defensive try/catch around its message loop, not
+        // anything in our code). A bug anywhere else — this method, onNewIntent,
+        // playFromIntent, a MediaSession callback, PlayerView's surface handling — runs
+        // outside that protection and would previously force-close with nothing logged
+        // anywhere FastChannels could see (fc_player_bridge.check_playback_errors() only
+        // ever tailed the FCPlayer.Playback tag). Log under our own tag FIRST, then chain
+        // to the platform's default handler so the crash still proceeds exactly as it
+        // otherwise would (dialog/relaunch/process death) — never try to keep running
+        // after an uncaught exception on an arbitrary thread, the JVM state past that
+        // point isn't trustworthy.
+        final Thread.UncaughtExceptionHandler platformHandler = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            Log.e(TAG_CRASH, "UNCAUGHT on thread " + thread.getName()
+                    + " channel_key=" + activeChannelKey + ": " + throwable, throwable);
+            if (platformHandler != null) {
+                platformHandler.uncaughtException(thread, throwable);
+            }
+        });
+
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                 | WindowManager.LayoutParams.FLAG_FULLSCREEN);
 
@@ -117,11 +164,42 @@ public class PlaybackActivity extends Activity {
         // one hung this way). Logging under TAG here is also what
         // fc_player_bridge.check_playback_errors() tails via `adb logcat -s
         // FCPlayer.Playback:E` to surface the failure in FastChannels' own logs.
+        //
+        // A bounded retry (see MAX_RETRIES) runs first: player.prepare() alone recovers from
+        // the transient internal Media3 errors this class of live-DASH-DRM failure produces
+        // (confirmed live 2026-09-14, see MAX_RETRIES comment) without needing a fresh
+        // MediaItem/license fetch. Only after retries are exhausted does this fall back to the
+        // original finish()-and-exit-to-home behavior.
         player.addListener(new Player.Listener() {
             @Override
             public void onPlayerError(PlaybackException error) {
-                Log.e(TAG, "playback error channel_key=" + activeChannelKey + ": " + error, error);
-                finish();
+                Log.e(TAG, "playback error channel_key=" + activeChannelKey
+                        + " (retry " + retryCount + "/" + MAX_RETRIES + "): " + error, error);
+                retryHandler.removeCallbacks(resetRetryCount);
+                if (retryCount < MAX_RETRIES) {
+                    retryCount++;
+                    retryHandler.postDelayed(() -> {
+                        Log.i(TAG, "retrying playback channel_key=" + activeChannelKey);
+                        player.prepare();
+                    }, RETRY_DELAY_MS);
+                } else {
+                    Log.e(TAG, "giving up after " + MAX_RETRIES + " retries channel_key=" + activeChannelKey);
+                    finish();
+                }
+            }
+
+            @Override
+            public void onIsPlayingChanged(boolean isPlaying) {
+                // A retry that actually holds for a while (as opposed to erroring again
+                // immediately) means the stream has genuinely recovered, not just a channel
+                // that's permanently broken — reset the budget so a later, unrelated transient
+                // error still gets its own full set of retries instead of inheriting an
+                // exhausted counter from hours ago.
+                if (isPlaying) {
+                    retryHandler.postDelayed(resetRetryCount, RETRY_RESET_AFTER_MS);
+                } else {
+                    retryHandler.removeCallbacks(resetRetryCount);
+                }
             }
         });
         playerView.setPlayer(player);
@@ -192,6 +270,11 @@ public class PlaybackActivity extends Activity {
         }
 
         Log.i(TAG, "playing \"" + title + "\" drm=" + drm + " url=" + streamUrl);
+        // A fresh tune is a clean slate — cancel any retry left pending from whatever was
+        // previously playing (its scheduled player.prepare() would otherwise race this one)
+        // and don't carry its exhausted-or-not retry budget onto an unrelated channel.
+        retryHandler.removeCallbacksAndMessages(null);
+        retryCount = 0;
         activeChannelKey = intent.getStringExtra(EXTRA_CHANNEL_KEY);
         player.setMediaItem(itemBuilder.build());
         player.prepare();
@@ -215,6 +298,8 @@ public class PlaybackActivity extends Activity {
         }
 
         Log.i(TAG, "warm-stopping " + (activeChannelKey == null ? "player" : activeChannelKey));
+        retryHandler.removeCallbacksAndMessages(null);
+        retryCount = 0;
         player.stop();
         player.clearMediaItems();
         activeChannelKey = null;
@@ -225,6 +310,7 @@ public class PlaybackActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        retryHandler.removeCallbacksAndMessages(null);
         if (mediaSession != null) {
             mediaSession.release();
             mediaSession = null;

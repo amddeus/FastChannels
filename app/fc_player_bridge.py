@@ -220,6 +220,22 @@ _WEB_HEARTBEAT_TTL_S = 45
 # (DRM denial, entitlement rejection, decode error) shows up in FastChannels' own log
 # stream without pulling logcat off the device by hand.
 _PLAYBACK_ERROR_LOG_TAG = 'FCPlayer.Playback'
+# onPlayerError only ever fires for errors Media3's own internal playback thread catches
+# and wraps into a PlaybackException — a bug anywhere else in the app (onCreate, a
+# MediaSession callback, PlayerView's surface handling) runs outside that protection and
+# force-closes instead. PlaybackActivity's global UncaughtExceptionHandler (2026-09-14) logs
+# those under this SEPARATE tag before chaining to the platform's own crash handling —
+# separate from _PLAYBACK_ERROR_LOG_TAG deliberately: confirmed live that logging a real
+# forced crash (`adb shell am crash`) under the same tag as onPlayerError made it get
+# classified here as a mere "playback error" WARNING instead of an ERROR, since this
+# module only had the tag to go on. _ANDROIDRUNTIME_LOG_TAG is a second, independent
+# fallback — Android's own platform crash dump, which our handler chains into and which
+# would still fire even for a hypothetical crash before our handler gets installed — but
+# it's a shared system tag every crashing app on the device writes to, so entries under it
+# are filtered to ones naming our own package before being surfaced.
+_APP_CRASH_LOG_TAG = 'FCPlayer.Crash'
+_ANDROIDRUNTIME_LOG_TAG = 'AndroidRuntime'
+_PACKAGE_NAME = 'com.fastchannels.player'
 _LAST_ERROR_LOGCAT_LINE_KEY = 'fc:fc-player:last-error-logcat-line'
 
 
@@ -1084,28 +1100,78 @@ def _group_logcat_entries(text: str) -> list[str]:
     return entries
 
 
+def _is_relevant_entry(entry: str) -> bool:
+    """_ANDROIDRUNTIME_LOG_TAG is a shared system tag — every crashing app on the device
+    writes to it, not just ours — so an entry under it only counts if it actually names
+    our package (the standard "Process: <pkg>, PID: <pid>" line a FATAL EXCEPTION dump
+    always includes). Entries under our own two tags are never filtered here since those
+    are already exclusively ours."""
+    first_line = entry.splitlines()[0] if entry else ''
+    if _ANDROIDRUNTIME_LOG_TAG not in first_line:
+        return True
+    return _PACKAGE_NAME in entry
+
+
+def _entry_is_crash(entry: str) -> bool:
+    """True for a real crash (our own pre-crash tag, or the platform's own dump naming
+    our package — _is_relevant_entry already dropped ones that don't). False for a plain
+    _PLAYBACK_ERROR_LOG_TAG entry, which is a playback error Media3 already handled via
+    onPlayerError, not an uncaught exception."""
+    first_line = entry.splitlines()[0] if entry else ''
+    return _APP_CRASH_LOG_TAG in first_line or _ANDROIDRUNTIME_LOG_TAG in first_line
+
+
+def _entry_summary(entry: str) -> str:
+    """One-line summary for the log: for our own tags that's just the first physical
+    line, as before. For an AndroidRuntime dump specifically, the first line is only
+    ever "FATAL EXCEPTION: <thread>" — the actual exception type/message and the
+    process line follow a couple of lines later, so surface up to 3 header-stripped
+    lines instead of the uninformative first one alone."""
+    lines = entry.splitlines()
+    if not lines:
+        return entry.strip()
+    if _ANDROIDRUNTIME_LOG_TAG not in lines[0]:
+        return lines[0].strip()
+    content = [ln.split('): ', 1)[-1].strip() for ln in lines[:3]]
+    return ' | '.join(c for c in content if c)
+
+
 def check_playback_errors() -> None:
     """Watchdog tick (app.worker's scheduled job): tail the device's logcat for a fresh
-    PlaybackActivity.onPlayerError entry and re-emit its summary line into
-    FastChannels' own log stream under this module's logger, so a failed tune shows
-    up in the admin log viewer without anyone needing to physically pull logcat off
-    the Fire TV/Android device.
+    PlaybackActivity.onPlayerError entry OR an actual app crash (our own pre-crash tag,
+    or the platform's own AndroidRuntime dump scoped to our package — see
+    _is_relevant_entry/_entry_is_crash), and re-emit a summary line into FastChannels'
+    own log stream under this module's logger, so either one shows up in the admin log
+    viewer without anyone needing to physically pull logcat off the Fire TV/Android
+    device. The two are logged at different levels (error vs warning) so a real crash
+    — meaning something outside Media3's own internal error handling broke, see
+    PlaybackActivity's UncaughtExceptionHandler — reads as more severe than a playback
+    error the app already recovered from or cleanly exited on.
 
     Each adb server (this container's included) needs its own `adb connect` before
     `adb -s <address> shell ...` works — trigger_channel() already does this per call;
     this watchdog runs independently of any trigger, so it has to do the same.
 
-    `adb logcat -d` dumps the whole (circular, bounded) buffer for the filtered tag
-    each time — cheap since the tag is only ever written on a real player error.
+    `adb logcat -d` dumps the whole (circular, bounded) buffer for the filtered tags
+    each time — cheap since our own two tags are only ever written on a real failure,
+    and AndroidRuntime entries not naming our package are dropped immediately. A
+    genuine post-onCreate crash produces both our own tag's entry AND an AndroidRuntime
+    entry for the same event (our UncaughtExceptionHandler logs, then chains to the
+    platform's own handler) — both get surfaced rather than deduplicated, since they
+    carry complementary detail (ours has the channel_key; AndroidRuntime's has
+    Android's canonical process/thread framing) and the redundancy only shows up on an
+    actual crash, which should be rare.
+
     Log.e(tag, msg, throwable) writes ONE entry whose message embeds the full stack
     trace, but `-v time` repeats the timestamp/tag/pid header on every line of that
     trace when printing it — so this splits back into whole entries on that repeated
-    header (one onPlayerError call must become one emitted log line, not a dozen) and
-    tracks the last whole entry it already emitted in Redis, logging only the newest
-    line of any new one. If that entry has aged out of the buffer (device rebooted,
-    app reinstalled, first run ever) it deliberately only surfaces the newest entry
-    rather than replaying whatever backlog remains, the same "don't replay a
-    backlog" caution check_idle_and_stop() uses for its own DVR lookup cache.
+    header (one onPlayerError call, or one crash dump, must become one emitted log
+    line, not a dozen) and tracks the last whole entry it already emitted in Redis,
+    logging only the newest lines of any new ones. If that entry has aged out of the
+    buffer (device rebooted, app reinstalled, first run ever) it deliberately only
+    surfaces the newest entry rather than replaying whatever backlog remains, the same
+    "don't replay a backlog" caution check_idle_and_stop() uses for its own DVR lookup
+    cache.
     """
     if not is_configured():
         return
@@ -1120,10 +1186,11 @@ def check_playback_errors() -> None:
         logger.warning('[fc-player] playback-error watchdog adb connect failed: %s', e)
         return
     ok, text = _adb_shell(address, 'logcat', '-d', '-v', 'time',
-                           '-s', f'{_PLAYBACK_ERROR_LOG_TAG}:E', '*:S')
+                           '-s', f'{_PLAYBACK_ERROR_LOG_TAG}:E', f'{_APP_CRASH_LOG_TAG}:E',
+                           f'{_ANDROIDRUNTIME_LOG_TAG}:E', '*:S')
     if not ok or not text.strip():
         return
-    entries = _group_logcat_entries(text)
+    entries = [e for e in _group_logcat_entries(text) if _is_relevant_entry(e)]
     if not entries:
         return
 
@@ -1139,7 +1206,11 @@ def check_playback_errors() -> None:
     else:
         new_entries = entries[-1:]
     for entry in new_entries:
-        logger.warning('[fc-player] device playback error: %s', entry.splitlines()[0].strip())
+        if _entry_is_crash(entry):
+            logger.error('[fc-player] device app CRASHED (uncaught exception, not just a '
+                         'playback error): %s', _entry_summary(entry))
+        else:
+            logger.warning('[fc-player] device playback error: %s', _entry_summary(entry))
 
     try:
         r.set(_LAST_ERROR_LOGCAT_LINE_KEY, entries[-1])
