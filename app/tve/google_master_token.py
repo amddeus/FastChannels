@@ -100,6 +100,34 @@ def exchange_oauth_token(oauth_token: str) -> dict | None:
     return {'email': email, 'master_token': master_token, 'android_id': android_id, 'captured_at': int(time.time())}
 
 
+def mint_youtubetv_bearer_token(saved: dict) -> str | None:
+    """Mint a fresh Bearer token scoped to the real YouTube TV Android app
+    identity (ANDROID_UNPLUGGED InnerTube client) from a saved master_token —
+    no browser, no re-login. Used by app/scrapers/youtubetv.py to call
+    youtubei.googleapis.com directly. This is the SAME gpsoauth call
+    exchange_oauth_token() already makes to verify a freshly-captured
+    master_token (_YTTV_SCOPE/_YTTV_APP/_YTTV_CLIENT_SIG above); confirmed
+    live 2026-09-15 that a plain OAuth device-code Bearer token (narrower
+    `youtube` scope) is NOT accepted by youtubei.googleapis.com's player
+    endpoint (400 INVALID_ARGUMENT) while this gpsoauth-minted, wider-scope
+    token is. Returns None on any failure — callers should treat that as
+    "YouTube TV auth unavailable right now" (revoked/expired master_token),
+    not a hard error, same as mint_browser_cookies()."""
+    try:
+        result = gpsoauth.perform_oauth(
+            saved['email'], saved['master_token'], saved['android_id'],
+            service=_YTTV_SCOPE, app=_YTTV_APP, client_sig=_YTTV_CLIENT_SIG,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('[google-master-token] YouTube TV bearer mint failed: %s', exc)
+        return None
+    token = result.get('Auth')
+    if not token:
+        logger.warning('[google-master-token] YouTube TV bearer mint rejected: %s', result.get('Error', result))
+        return None
+    return token
+
+
 def mint_browser_cookies(saved: dict) -> list[dict] | None:
     """Mint a fresh set of real Google session cookies (SID, HSID, SAPISID,
     __Secure-1PSID, etc.) from a saved master_token — no browser, no

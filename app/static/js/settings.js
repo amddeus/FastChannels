@@ -691,6 +691,8 @@ function updateTveProviderFields() {
   if (lastStatus) lastStatus.style.display = isCox ? '' : 'none';
   const googleRow = document.getElementById('tve-google-signin-row');
   if (googleRow) googleRow.style.display = provider.id === 'YouTubeTV' ? '' : 'none';
+  const youtubetvGuideRow = document.getElementById('tve-youtubetv-guide-signin-row');
+  if (youtubetvGuideRow) youtubetvGuideRow.style.display = provider.id === 'YouTubeTV' ? '' : 'none';
   if (select) select.dataset.previousProvider = provider.id;
 }
 
@@ -867,6 +869,7 @@ const MVPD_LOGIN_FAMILIES = {
   discovery: { base: '/api/settings/tve/discovery/browser-login', needsRequestor: false },
   foxone:    { base: '/api/settings/tve/foxone/browser-login', needsRequestor: false },
   google:    { base: '/api/settings/tve/google/browser-login', needsRequestor: false },
+  'youtubetv-guide': { base: '/api/settings/tve/youtubetv-guide/browser-login', needsRequestor: false },
 };
 let _mvpdLoginActive = false;
 let _mvpdLoginDone = false;
