@@ -876,6 +876,15 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
             except TVENotAuthorizedError as exc:
                 raise TVENotAuthorizedError(f'{channel.name}: {exc}') from exc
             except TVEAuthError as exc:
+                # See fox_tve.py's _fox_sports_access_token() for why this
+                # also needs the per-network status — AMCN doesn't even
+                # track this in TVEAccount.last_auth_message, so without
+                # this the failure would otherwise be invisible everywhere.
+                try:
+                    from ..tve.browser_login.common import _record_tve_login_error
+                    _record_tve_login_error('amcn', str(exc)[:300])
+                except Exception:  # noqa: BLE001
+                    pass
                 raise TVEAuthError(f'{channel.name}: {exc}') from exc
 
         adobe_token, adobe_id, notafter_ms = self._adobe_decision_finish(client.session, channel, code, mso_id, auth_headers)

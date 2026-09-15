@@ -847,6 +847,14 @@ class NbcTveScraper(MvpdCooldownMixin, BaseScraper):
             account.last_auth_message = f'NBC TVE: Adobe Pass auth failed: {exc}'[:500]
             account.last_auth_at = datetime.now(timezone.utc)
             db.session.commit()
+            # See fox_tve.py's _fox_sports_access_token() for why this also
+            # needs the per-network status, not just the easily-overwritten
+            # account-wide last_auth_message.
+            try:
+                from ..tve.browser_login.common import _record_tve_login_error
+                _record_tve_login_error('nbc', str(exc)[:300])
+            except Exception:  # noqa: BLE001
+                pass
             raise TVEAuthError(f'NBC TVE: Adobe Pass auth failed: {exc}') from exc
 
         self._update_cache('nbc_entitlements', {

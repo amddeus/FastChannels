@@ -557,10 +557,25 @@ class DiscoveryTVEScraper(MvpdCooldownMixin, BaseScraper):
             from ..tve.mvpd import login_to_mvpd
             cookie_jar = cfg.get('xfinity_cookie_jar')
             page_html, page_url = (r.text, str(r.url)) if not mso_login_url else ('', mso_login_url)
-            code_url = login_to_mvpd(
-                mso_id, page_html, page_url, account.username or '', account.password or '',
-                cookie_jar=cookie_jar,
-            )
+            try:
+                code_url = login_to_mvpd(
+                    mso_id, page_html, page_url, account.username or '', account.password or '',
+                    cookie_jar=cookie_jar,
+                )
+            except TVENotAuthorizedError:
+                raise
+            except TVEAuthError as exc:
+                # See fox_tve.py's _fox_sports_access_token() for why this
+                # also needs the per-network status — Discovery doesn't even
+                # track this in TVEAccount.last_auth_message (no try/except
+                # existed here at all before), so without this the failure
+                # would otherwise be invisible everywhere.
+                try:
+                    from ..tve.browser_login.common import _record_tve_login_error
+                    _record_tve_login_error('discovery', str(exc)[:300])
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
 
         code = (parse_qs(urlsplit(code_url).query).get('code') or [''])[0]
         if not code:
