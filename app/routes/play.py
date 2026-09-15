@@ -19,7 +19,7 @@ from urllib.parse import quote as _url_quote, urljoin, urlsplit, urlunsplit, par
 
 import requests as _requests
 
-from flask import Blueprint, redirect, abort, request, Response, render_template, g, stream_with_context, current_app
+from flask import Blueprint, redirect, abort, request, Response, render_template, g, stream_with_context, current_app, jsonify
 from app.config_store import persist_source_config_updates, persist_source_cache_updates, load_source_cache
 from ..hls import inspect_hls_drm, parse_stream_info
 from ..models import Channel, Source
@@ -1996,6 +1996,35 @@ def philo_dash_proxy(channel_id: str):
     )
 
 
+@play_bp.route('/play/sling/<channel_id>/boundary-status')
+def sling_boundary_status(channel_id: str):
+    """Lightweight status check for fc_player's own client-side polling (see
+    fc_player_bridge.sling_boundary_status for the full design note) — lets the app
+    ask "is my next content block live yet?" and swap its own MediaItem locally the
+    instant it is, instead of waiting on the server-side watchdog's adb round trip.
+    Read-only; never mutates the block-boundary/retuned Redis state.
+    """
+    from urllib.parse import unquote as _unquote
+    from .. import fc_player_bridge
+
+    raw_id = _unquote(channel_id)
+    return jsonify(fc_player_bridge.sling_boundary_status(raw_id))
+
+
+@play_bp.route('/play/sling/<channel_id>/boundary-ack', methods=['POST'])
+def sling_boundary_ack(channel_id: str):
+    """fc_player calls this right after a successful Lever 2 local swap, so the
+    server-side watchdog (Lever 1) sees the boundary as already handled and skips its
+    own redundant adb retune — see fc_player_bridge.mark_boundary_handled_by_client.
+    """
+    from urllib.parse import unquote as _unquote
+    from .. import fc_player_bridge
+
+    raw_id = _unquote(channel_id)
+    fc_player_bridge.mark_boundary_handled_by_client(raw_id)
+    return ('', 204)
+
+
 @play_bp.route('/play/sling/<channel_id>/dash.mpd')
 def sling_dash_proxy(channel_id: str):
     """DASH (Widevine) manifest proxy for Sling bridge playback.
@@ -2034,6 +2063,13 @@ def sling_dash_proxy(channel_id: str):
         if scraper._pending_config_updates:
             try:
                 persist_source_config_updates(channel.source_id, scraper._pending_config_updates)
+            except Exception:
+                pass
+        next_boundary = getattr(scraper, 'last_schedule_next', None)
+        if next_boundary:
+            try:
+                from .. import fc_player_bridge
+                fc_player_bridge.note_block_boundary(f'sling:{raw_id}', next_boundary)
             except Exception:
                 pass
 
@@ -2949,6 +2985,22 @@ def play(source_name: str, channel_id: str):
 
 
 from ..drm_bridge import DRM_BRIDGE_TRUSTED_SOURCES as _DRM_BRIDGE_TRUSTED_SOURCES
+
+
+@play_bp.route('/play/fc-player/warm-stop-ack', methods=['POST'])
+def fc_player_warm_stop_ack():
+    """fc_player's warmStop() calls this right after ah4c tells it a viewer
+    disconnected, so the block-boundary watchdog stops tracking a channel nobody's
+    watching anymore — see fc_player_bridge.clear_active_channel_tracking. Generic
+    across sources (channel_key is 'source:id', not sling-specific like the
+    boundary-status/-ack routes), since warm_stop itself applies to any bridged
+    source, not just Sling's clipslist channels.
+    """
+    from .. import fc_player_bridge
+
+    channel_key = (request.args.get('channel_key') or '').strip()
+    fc_player_bridge.clear_active_channel_tracking(channel_key)
+    return ('', 204)
 
 
 @play_bp.route('/play/fc-player/<source_name>/<channel_id>.m3u8')

@@ -3775,6 +3775,52 @@ if __name__ == '__main__':
                           id='fc_player_playback_error_watchdog', max_instances=1, coalesce=True,
                           misfire_grace_time=60)
 
+        # Two-part design (see fc_player_bridge.pending_block_boundaries's docstring for
+        # why): this discovery tick just notices known boundaries and registers a
+        # precise one-shot job per channel for the exact instant each is due, instead
+        # of firing the retune directly on its own 20s cadence. That precise job is
+        # what actually eliminates the tick-alignment waste a plain interval poll has
+        # (measured live 2026-09-15: up to ~20s of it) — the discovery tick itself can
+        # stay coarse since each boundary is known minutes-to-hours before it matters,
+        # so there's no rush to *notice* it, only to *act* on it precisely once known.
+        # Iterates all currently-tracked channels (plural, not singular) so multiple
+        # concurrent ah4c tuners each get their own independently-scheduled job.
+        def _fire_fc_player_boundary_retune(channel_key, boundary_ts):
+            from app import fc_player_bridge
+            try:
+                with flask_app.app_context():
+                    fc_player_bridge.fire_block_boundary_retune(channel_key, boundary_ts)
+            except Exception as e:
+                logger.warning('[fc-player] block-boundary retune job failed for %s: %s', channel_key, e)
+
+        def _scheduled_fc_player_block_boundary_discovery():
+            from app import fc_player_bridge
+            try:
+                with flask_app.app_context():
+                    pending_list = fc_player_bridge.pending_block_boundaries()
+                for channel_key, boundary_ts in pending_list:
+                    # Small head start only — fire_block_boundary_retune does its own
+                    # active verification polling from here rather than trusting a
+                    # fixed buffer, so this just skips the guaranteed-miss
+                    # instant-at-boundary check (see _BLOCK_BOUNDARY_INITIAL_DELAY_S).
+                    run_date = datetime.fromtimestamp(
+                        boundary_ts + fc_player_bridge._BLOCK_BOUNDARY_INITIAL_DELAY_S, tz=timezone.utc)
+                    # replace_existing + a channel-scoped id makes this idempotent and
+                    # self-correcting: re-registering with an unchanged run_date is a
+                    # harmless no-op, and a changed boundary (Sling rescheduling content)
+                    # just reschedules the same job to the new instant.
+                    scheduler.add_job(
+                        _fire_fc_player_boundary_retune, 'date', run_date=run_date,
+                        id=f'fc_player_boundary_retune:{channel_key}', replace_existing=True,
+                        misfire_grace_time=120, args=[channel_key, boundary_ts],
+                    )
+            except Exception as e:
+                logger.warning('[fc-player] block-boundary discovery tick failed: %s', e)
+
+        scheduler.add_job(_scheduled_fc_player_block_boundary_discovery, 'interval', seconds=20,
+                          id='fc_player_block_boundary_discovery', max_instances=1, coalesce=True,
+                          misfire_grace_time=60)
+
         def _scheduled_remote_gracenote_refresh():
             from app.gracenote_map import fetch_remote_gracenote_map
             with flask_app.app_context():

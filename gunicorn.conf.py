@@ -32,6 +32,7 @@ _SUPPRESS_PATTERNS = (
     '/play/stirr/segment',     # stirr relay segments — one per ~5s per viewer
     '/play/cspan/segment',     # cspan relay segments — one per ~6s per viewer
     '/play/stirr/variant',     # stirr variant manifest refresh every ~5s
+    '/boundary-status',        # fc_player's Lever 2 poll — 30s far out, 1.5s near a known boundary
     '/proxy.m3u8',             # manifest proxy polls every ~3s during playback
     '"GET /static/',           # static asset cache hits — 304s add no signal
     '"HEAD /static/',          # deployment/sanity probes of static assets
