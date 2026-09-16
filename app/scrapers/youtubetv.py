@@ -69,7 +69,8 @@ from datetime import datetime, timezone
 
 from .base import BaseScraper, ChannelData, ProgramData
 from .category_utils import category_for_channel
-from ..models import TVEAccount
+from ..extensions import db
+from ..models import Source, TVEAccount
 from ..tve import adobe_pass
 from ..tve.google_master_token import mint_youtubetv_bearer_token
 
@@ -317,6 +318,29 @@ class YouTubeTVAuthError(RuntimeError):
     pass
 
 
+def load_youtubetv_google_master_token() -> dict | None:
+    """This scraper's OWN Google master_token, stored on the youtubetv Source's
+    own config — deliberately independent of the TVE feature's TVEAccount row
+    (which has its own, unrelated master_token for YouTubeTV-as-MVPD priming).
+    Someone who never touches TVE can still configure/use this scraper; see
+    _bearer_token()'s TVE fallback below for the one deliberate point of
+    sharing (reuse a token that's already there, don't force a second login)."""
+    source = Source.query.filter_by(name='youtubetv').first()
+    if not source:
+        return None
+    return (source.config or {}).get('google_master_token') or None
+
+
+def save_youtubetv_google_master_token(data: dict) -> None:
+    source = Source.query.filter_by(name='youtubetv').first()
+    if not source:
+        return
+    cfg = dict(source.config or {})
+    cfg['google_master_token'] = data
+    source.config = cfg
+    db.session.commit()
+
+
 def channel_id_for_url(raw_url: str) -> str | None:
     if not raw_url or not raw_url.startswith(SCHEME):
         return None
@@ -331,24 +355,42 @@ class YouTubeTVScraper(BaseScraper):
     display_name = 'YouTube TV'
     source_category = 'premium'
     is_premium = True
-    config_required = True  # needs the shared Google sign-in (Settings -> TVE) done first
+    config_required = True  # needs its own Google sign-in done first (this source's own config panel)
     under_development = True  # channel/EPG discovery only, no playback yet
     scrape_interval = 720
     stream_audit_enabled = False  # nothing resolvable to audit yet
 
     def _bearer_token(self) -> str:
-        account = TVEAccount.query.filter_by(provider_id='mvpd').first()
-        if not account:
-            raise YouTubeTVAuthError('TVE account not found — save TVE settings first.')
-        saved = adobe_pass.load_google_master_token(account)
+        saved = load_youtubetv_google_master_token()
+        via_tve = False
+        if not saved:
+            # Deliberate one-way sharing: if the (separate, optional) TVE
+            # feature already has a Google sign-in on file, reuse it rather
+            # than force a second login for the same account — but this
+            # scraper's OWN token (checked first, above) never requires TVE
+            # to be configured or enabled at all.
+            tve_account = TVEAccount.query.filter_by(provider_id='mvpd').first()
+            if tve_account:
+                saved = adobe_pass.load_google_master_token(tve_account)
+                via_tve = bool(saved)
         if not saved:
             raise YouTubeTVAuthError(
-                'No Google sign-in on file — use "Sign in with Google" in Settings -> TVE first.')
+                'No Google sign-in on file — use "Sign in with Google" in this '
+                'source\'s own config panel (Sources -> YouTube TV -> Configure).')
         token = mint_youtubetv_bearer_token(saved)
+        at = int(time.time())
         if not token:
+            self._update_config('google_signin_last_check', {
+                'status': 'error', 'message': 'token mint failed (revoked or expired)', 'at': at,
+            })
             raise YouTubeTVAuthError(
                 'Google sign-in on file could not mint a YouTube TV token '
                 '(revoked or expired) — sign in with Google again.')
+        self._update_config('google_signin_last_check', {
+            'status': 'ok',
+            'message': 'minted OK' + (' (via the shared TVE Google sign-in)' if via_tve else ''),
+            'at': at,
+        })
         return token
 
     def _api_call(self, bearer: str, endpoint: str, body: dict) -> dict:

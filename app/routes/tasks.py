@@ -513,11 +513,11 @@ def stop_sling_browser_login():
 # waits (up to job_timeout) for the first to release the shared profile.
 _MVPD_TVE_PROFILE_JOB_IDS = (
     'mvpd-browser-login', 'nbc-mvpd-browser-login', 'fox-mvpd-browser-login', 'google-signin',
-    'youtubetv-guide-signin',
+    'youtubetv-guide-signin', 'youtubetv-google-signin',
 )
 _MVPD_TVE_PROFILE_THREAD_NAMES = (
     'mvpd-browser-login-fallback', 'nbc-mvpd-browser-login-fallback', 'fox-mvpd-browser-login-fallback',
-    'google-signin-fallback', 'youtubetv-guide-signin-fallback',
+    'google-signin-fallback', 'youtubetv-guide-signin-fallback', 'youtubetv-google-signin-fallback',
 )
 
 
@@ -861,6 +861,43 @@ def stop_youtubetv_guide_signin() -> None:
         r.setex('yttv-guide:browser-login:stop', 30, '1')
     except Exception as e:
         logger.warning(f'Failed to signal YouTube TV guide sign-in stop: {e}')
+    _force_kill_mvpd_browser()
+
+
+def trigger_youtubetv_google_signin() -> bool:
+    """Standalone "Sign in with Google" for the youtubetv scraper's OWN
+    config — see app.tve.browser_login.youtubetv_guide.run_youtubetv_google_
+    signin's docstring for why this isn't just trigger_google_signin(). Still
+    shares the mvpd_tve profile/busy-lock (a real file-lock constraint), but
+    has no TVE-account dependency. Returns True if a job was enqueued, False
+    if one is already running."""
+    try:
+        q = get_fast_queue()
+        job_id = 'youtubetv-google-signin'
+        if _mvpd_tve_profile_busy(q):
+            logger.debug('MVPD browser login already running')  # see trigger_mvpd_browser_login
+            return False
+        q.enqueue('app.tve.browser_login.youtubetv_guide.run_youtubetv_google_signin', job_timeout=630, job_id=job_id)
+        logger.info('Enqueued YouTube TV (scraper) Google sign-in')
+        return True
+    except Exception as e:
+        logger.warning(f'RQ unavailable ({e}), falling back to thread for YouTube TV Google sign-in')
+        import threading
+        from app.tve.browser_login.youtubetv_guide import run_youtubetv_google_signin
+        thread_name = 'youtubetv-google-signin-fallback'
+        if _mvpd_tve_profile_busy_fallback():
+            logger.info('MVPD browser login fallback thread already running')
+            return False
+        threading.Thread(target=run_youtubetv_google_signin, daemon=True, name=thread_name).start()
+        return True
+
+
+def stop_youtubetv_google_signin() -> None:
+    try:
+        r = redis.from_url(current_app.config['REDIS_URL'])
+        r.setex('youtubetv-google:browser-login:stop', 30, '1')
+    except Exception as e:
+        logger.warning(f'Failed to signal YouTube TV Google sign-in stop: {e}')
     _force_kill_mvpd_browser()
 
 

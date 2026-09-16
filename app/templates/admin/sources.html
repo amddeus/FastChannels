@@ -1090,6 +1090,24 @@
     </div>
   </div>
 
+  <!-- YouTube TV interactive browser sign-in (Google account + guide session,
+       shares the mechanics of Sling's modal above but parameterized by
+       "family" since it drives two different account-level flows from one
+       panel — see YTTV_LOGIN_FAMILIES / openYoutubetvLoginModal below. -->
+  <div class="modal-overlay" id="youtubetv-login-modal" onclick="closeYoutubetvLoginModal(event)">
+    <div class="modal" onclick="event.stopPropagation()" style="max-width:1340px;">
+      <h2 id="youtubetv-login-title">Sign in</h2>
+      <p id="youtubetv-login-status" style="margin-bottom:0.75rem;">Launching browser…</p>
+      <img id="youtubetv-login-frame" alt="Sign-in" tabindex="0" draggable="false"
+           onmousedown="youtubetvLoginFrameMousedown(event)" onkeydown="youtubetvLoginFrameKeydown(event)"
+           onmousemove="youtubetvLoginFrameMousemove(event)" ondragstart="return false;"
+           style="max-width:100%;width:1280px;border:1px solid var(--border);border-radius:4px;cursor:text;outline-offset:2px;background:#111;user-select:none;">
+      <div class="modal-actions">
+        <button class="btn btn-cancel" type="button" onclick="_closeYoutubetvLoginModal(true)">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Confirm disable modal -->
   <div class="modal-overlay" id="confirm-modal">
     <div class="modal">
@@ -2853,7 +2871,11 @@
           return;
         }
 
-        if (!schema.length) {
+        // youtubetv has no saveable config fields (its "config" is a Google
+        // sign-in, not text/toggle fields) but still needs its own bespoke
+        // panel — see renderYoutubetvConfig below — so it's exempted from
+        // the empty-schema short-circuit every other zero-field source hits.
+        if (!schema.length && sourceName !== 'youtubetv') {
           if (badge) {
             badge.textContent = 'Auto';
             badge.className = 'config-badge auto';
@@ -3540,6 +3562,192 @@
       _slingLoginSendInput({ type: 'key', key: event.key });
     }
 
+    // ── YouTube TV sign-in (account-level, not per-source) ──────────────────
+    // Same interactive-browser-relay mechanism as Sling's above, but this
+    // panel drives TWO separate flows (Google account sign-in, and a real
+    // tv.youtube.com guide session) against account-level routes rather than
+    // one flow against a per-source-id route — see
+    // app/tve/browser_login/google.py and .../youtubetv_guide.py.
+    const YTTV_LOGIN_FAMILIES = {
+      google: { base: '/api/settings/youtubetv/google-signin', title: 'Sign in with Google' },
+      'youtubetv-guide': { base: '/api/settings/youtubetv/guide-signin', title: 'Sign in to YouTube TV guide' },
+    };
+
+    function renderYoutubetvConfig(sourceId, cfg) {
+      cfg = cfg || {};
+      const tok = cfg.google_master_token || {};
+      const googleStatusHtml = tok.email
+        ? `<div class="help" style="color:var(--success-soft);">✓ Signed in as ${escapeHtml(tok.email)}${tok.captured_at ? ' — ' + _epochAgo(tok.captured_at) : ''}</div>`
+        : `<div class="help">Not signed in yet.</div>`;
+      const check = cfg.google_signin_last_check || {};
+      const checkHtml = check.at
+        ? `<div class="help" style="${check.status === 'error' ? 'color:var(--danger)' : 'color:var(--text-muted)'}">Last verified: ${_epochAgo(check.at)}${check.message ? ' — ' + escapeHtml(check.message) : ''}</div>`
+        : `<div class="help">Not verified yet — confirms automatically on the next scrape.</div>`;
+      const guideAt = cfg.guide_signin_at;
+      const guideStatusHtml = guideAt
+        ? `<div class="help" style="color:var(--success-soft);">✓ Signed in ${_epochAgo(guideAt)}</div>`
+        : `<div class="help">Not signed in yet.</div>`;
+
+      return `
+        <div class="config-title">YouTube TV Sign-in</div>
+        <div class="config-note">YouTube TV needs a real Google sign-in — this is fully independent of the shared TV-provider credentials under Settings → TVE (a separate feature that doesn't need to be configured or enabled for this). Two steps, both one-time (the resulting session is reused automatically after this):</div>
+        <div class="fields-grid">
+          <div class="field field-full" style="margin:0.25rem 0 0.5rem;">
+            <button class="btn btn-run" type="button" onclick="openYoutubetvLoginModal('google', ${sourceId})">1. Sign in with Google</button>
+            <div class="help">Authorizes this account with Google directly. Needed to pull the channel list and program guide.</div>
+            ${googleStatusHtml}
+            ${checkHtml}
+          </div>
+          <div class="field field-full" style="margin:0.25rem 0 0.5rem;">
+            <button class="btn btn-run" type="button" onclick="openYoutubetvLoginModal('youtubetv-guide', ${sourceId})">2. Sign in to YouTube TV guide</button>
+            <div class="help">Signs in at tv.youtube.com itself — a Google sign-in alone doesn't carry over. Used for reading real channel names/logos straight from the guide page.</div>
+            ${guideStatusHtml}
+          </div>
+        </div>`;
+    }
+
+    let _youtubetvLoginFamily = null;
+    let _youtubetvLoginSourceId = null;
+    let _youtubetvLoginPollTimer = null;
+    let _youtubetvLoginDone = false;
+
+    function openYoutubetvLoginModal(family, sourceId) {
+      const cfg = YTTV_LOGIN_FAMILIES[family];
+      if (!cfg) return;
+      _youtubetvLoginFamily = family;
+      _youtubetvLoginSourceId = sourceId;
+      _youtubetvLoginDone = false;
+      if (_youtubetvLoginPollTimer) { clearTimeout(_youtubetvLoginPollTimer); _youtubetvLoginPollTimer = null; }
+      const modal = document.getElementById('youtubetv-login-modal');
+      const frame = document.getElementById('youtubetv-login-frame');
+      const status = document.getElementById('youtubetv-login-status');
+      document.getElementById('youtubetv-login-title').textContent = cfg.title;
+      frame.removeAttribute('src');
+      frame.style.visibility = 'hidden';  // no src yet - avoid showing a broken-image icon
+      status.className = '';
+      status.textContent = 'Launching browser…';
+      modal.classList.add('open');
+      fetch(`${cfg.base}/start`, { method: 'POST' })
+        .then(r => r.json())
+        .catch(() => {})
+        .finally(() => _pollYoutubetvLoginModal());
+    }
+
+    function closeYoutubetvLoginModal(event) {
+      if (event && event.target !== document.getElementById('youtubetv-login-modal')) return;
+      _closeYoutubetvLoginModal(true);
+    }
+
+    function _closeYoutubetvLoginModal(cancel) {
+      document.getElementById('youtubetv-login-modal').classList.remove('open');
+      if (_youtubetvLoginPollTimer) { clearTimeout(_youtubetvLoginPollTimer); _youtubetvLoginPollTimer = null; }
+      const family = _youtubetvLoginFamily;
+      _youtubetvLoginFamily = null;
+      _youtubetvLoginSourceId = null;
+      if (cancel && !_youtubetvLoginDone && family) {
+        fetch(`${YTTV_LOGIN_FAMILIES[family].base}/stop`, { method: 'POST' }).catch(() => {});
+      }
+    }
+
+    async function _pollYoutubetvLoginModal() {
+      if (!_youtubetvLoginFamily) return;
+      const family = _youtubetvLoginFamily;
+      try {
+        const r = await fetch(`${YTTV_LOGIN_FAMILIES[family].base}/state`);
+        const d = await r.json();
+        if (_youtubetvLoginFamily !== family) return;  // modal was closed/reopened mid-poll
+
+        const status = document.getElementById('youtubetv-login-status');
+        const frame = document.getElementById('youtubetv-login-frame');
+        if (d.screenshot) {
+          frame.src = `data:image/jpeg;base64,${d.screenshot}`;
+          frame.style.visibility = 'visible';
+        }
+
+        if (d.state === 'success') {
+          _youtubetvLoginDone = true;
+          status.className = 'success';
+          status.textContent = '✓ ' + (d.message || 'Signed in.');
+          const sourceId = _youtubetvLoginSourceId;
+          setTimeout(() => {
+            _closeYoutubetvLoginModal(false);
+            if (sourceId) loadSourceConfig(sourceId, 'youtubetv');
+          }, 1800);
+          return;
+        }
+        if (d.state === 'error' || d.state === 'stopped') {
+          _youtubetvLoginDone = true;
+          status.className = d.state === 'error' ? 'error' : '';
+          const prefix = d.state === 'error' ? '✗ ' : '';
+          status.textContent = prefix + (d.message || 'Sign-in stopped.');
+          return;  // leave the modal open showing the message; user closes manually
+        }
+        status.className = '';
+        status.textContent = d.message || 'Signing in…';
+      } catch (e) {
+        // transient — keep polling
+      }
+      _youtubetvLoginPollTimer = setTimeout(_pollYoutubetvLoginModal, 400);
+    }
+
+    function _youtubetvLoginFrameScale(frame) {
+      const rect = frame.getBoundingClientRect();
+      return {
+        x: (frame.naturalWidth || rect.width) / rect.width,
+        y: (frame.naturalHeight || rect.height) / rect.height,
+        rect,
+      };
+    }
+
+    function _youtubetvLoginSendInput(payload) {
+      if (!_youtubetvLoginFamily) return;
+      fetch(`${YTTV_LOGIN_FAMILIES[_youtubetvLoginFamily].base}/input`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+    }
+
+    let _youtubetvLoginDragging = false;
+
+    function youtubetvLoginFrameMousedown(event) {
+      if (!_youtubetvLoginFamily) return;
+      const frame = event.currentTarget;
+      frame.focus();
+      _youtubetvLoginDragging = true;
+      const { x: sx, y: sy, rect } = _youtubetvLoginFrameScale(frame);
+      _youtubetvLoginSendInput({ type: 'mousedown', x: (event.clientX - rect.left) * sx, y: (event.clientY - rect.top) * sy });
+    }
+
+    document.addEventListener('mouseup', function (event) {
+      if (!_youtubetvLoginDragging) return;
+      _youtubetvLoginDragging = false;
+      const frame = document.getElementById('youtubetv-login-frame');
+      if (!frame) return;
+      const { x: sx, y: sy, rect } = _youtubetvLoginFrameScale(frame);
+      _youtubetvLoginSendInput({ type: 'mouseup', x: (event.clientX - rect.left) * sx, y: (event.clientY - rect.top) * sy });
+    });
+
+    let _youtubetvLoginLastMoveSent = 0;
+
+    function youtubetvLoginFrameMousemove(event) {
+      if (!_youtubetvLoginFamily) return;
+      const now = performance.now();
+      if (now - _youtubetvLoginLastMoveSent < 60) return;  // throttle to ~16/s
+      _youtubetvLoginLastMoveSent = now;
+      const frame = event.currentTarget;
+      const { x: sx, y: sy, rect } = _youtubetvLoginFrameScale(frame);
+      const x = (event.clientX - rect.left) * sx;
+      const y = (event.clientY - rect.top) * sy;
+      _youtubetvLoginSendInput({ type: 'mousemove', x, y });
+    }
+
+    function youtubetvLoginFrameKeydown(event) {
+      if (!_youtubetvLoginFamily) return;
+      event.preventDefault();
+      _youtubetvLoginSendInput({ type: 'key', key: event.key });
+    }
+
     function renderConfigFields(sourceId, sourceName, schema, values, cfg) {
       let primarySchema = schema;
       let advancedSchema = [];
@@ -3566,6 +3774,8 @@
         return renderPhiloConfig(sourceId, schema, values);
       } else if (sourceName === 'sling') {
         return renderSlingConfig(sourceId, schema, values, cfg);
+      } else if (sourceName === 'youtubetv') {
+        return renderYoutubetvConfig(sourceId, cfg);
       } else if (sourceName === 'pbs') {
         return renderPbsConfig(sourceId, schema, values);
       }

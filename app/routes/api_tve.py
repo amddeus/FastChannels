@@ -476,24 +476,88 @@ def google_signin_stop():
     return jsonify({'status': 'stopping'})
 
 
-# Standalone "Sign in to YouTube TV guide" — a real interactive login against
-# tv.youtube.com/live itself (NOT Google's device-setup page), needed
-# because neither the shared mvpd_tve profile nor a master_token-minted
-# cookie set gets recognized as signed-in there. See
+# The youtubetv scraper's own sign-in flows — deliberately under
+# /settings/youtubetv/, NOT /settings/tve/, and with no TVE-account
+# dependency at all (no _get_tve_account/is_enabled check below). The TVE
+# feature's own "Sign in with Google" (above) and these are independent:
+# same Google account can serve both, but neither's storage/gating depends
+# on the other. See app/scrapers/youtubetv.py's load_youtubetv_google_
+# master_token docstring for the full reasoning.
+
+# Sign in with Google, saved to the youtubetv Source's own config (not
+# TVEAccount). See app.tve.browser_login.youtubetv_guide.run_youtubetv_
+# google_signin's docstring. Own redis-key namespace (youtubetv-google:*).
+@tve_bp.route('/settings/youtubetv/google-signin/start', methods=['POST'])
+def youtubetv_google_signin_start():
+    from .tasks import trigger_youtubetv_google_signin
+    started = trigger_youtubetv_google_signin()
+    return jsonify({'status': 'started' if started else 'already_running'})
+
+
+@tve_bp.route('/settings/youtubetv/google-signin/state')
+def youtubetv_google_signin_state():
+    import base64
+    import redis as _redis
+
+    r = _redis.from_url(current_app.config['REDIS_URL'])
+    raw_status = r.get('youtubetv-google:browser-login:status')
+    result = json.loads(raw_status) if raw_status else {'state': 'idle'}
+    shot = r.get('youtubetv-google:browser-login:screenshot')
+    if shot:
+        result['screenshot'] = base64.b64encode(shot).decode('ascii')
+    hint = r.get('youtubetv-google:browser-login:hint')
+    if hint:
+        result['hint'] = hint.decode('utf-8', 'replace') if isinstance(hint, bytes) else hint
+    log_lines = r.lrange('tve:browser-login:log', -40, -1)
+    if log_lines:
+        result['activity_log'] = [l.decode('utf-8', 'replace') if isinstance(l, bytes) else l for l in log_lines]
+    return jsonify(result)
+
+
+@tve_bp.route('/settings/youtubetv/google-signin/input', methods=['POST'])
+def youtubetv_google_signin_input():
+    import redis as _redis
+
+    data = request.get_json() or {}
+    kind = data.get('type')
+    if kind in ('click', 'mousemove', 'mousedown', 'mouseup'):
+        try:
+            payload = {'type': kind, 'x': float(data['x']), 'y': float(data['y'])}
+        except (KeyError, TypeError, ValueError):
+            return jsonify({'error': f'{kind} requires numeric x/y'}), 400
+    elif kind == 'key':
+        key = str(data.get('key') or '')
+        if not key:
+            return jsonify({'error': 'key requires a non-empty key'}), 400
+        payload = {'type': 'key', 'key': key}
+    else:
+        return jsonify({'error': 'invalid input type'}), 400
+    r = _redis.from_url(current_app.config['REDIS_URL'])
+    r.rpush('youtubetv-google:browser-login:input', json.dumps(payload))
+    r.expire('youtubetv-google:browser-login:input', 60)
+    return jsonify({'status': 'ok'})
+
+
+@tve_bp.route('/settings/youtubetv/google-signin/stop', methods=['POST'])
+def youtubetv_google_signin_stop():
+    from .tasks import stop_youtubetv_google_signin
+    stop_youtubetv_google_signin()
+    return jsonify({'status': 'stopping'})
+
+
+# Sign in to the real tv.youtube.com guide itself (NOT Google's device-setup
+# page) — needed because neither the shared mvpd_tve profile nor a
+# master_token-minted cookie set gets recognized as signed-in there. See
 # app.tve.browser_login.youtubetv_guide.run_youtubetv_guide_signin's
 # docstring. Own redis-key namespace (yttv-guide:browser-login:*).
-@tve_bp.route('/settings/tve/youtubetv-guide/browser-login/start', methods=['POST'])
+@tve_bp.route('/settings/youtubetv/guide-signin/start', methods=['POST'])
 def youtubetv_guide_signin_start():
     from .tasks import trigger_youtubetv_guide_signin
-
-    account = _get_tve_account('mvpd', 'TV Provider')
-    if not account.is_enabled:
-        return jsonify({'error': 'Enable and save the TVE account first.'}), 400
     started = trigger_youtubetv_guide_signin()
     return jsonify({'status': 'started' if started else 'already_running'})
 
 
-@tve_bp.route('/settings/tve/youtubetv-guide/browser-login/state')
+@tve_bp.route('/settings/youtubetv/guide-signin/state')
 def youtubetv_guide_signin_state():
     import base64
     import redis as _redis
@@ -513,7 +577,7 @@ def youtubetv_guide_signin_state():
     return jsonify(result)
 
 
-@tve_bp.route('/settings/tve/youtubetv-guide/browser-login/input', methods=['POST'])
+@tve_bp.route('/settings/youtubetv/guide-signin/input', methods=['POST'])
 def youtubetv_guide_signin_input():
     import redis as _redis
 
@@ -537,7 +601,7 @@ def youtubetv_guide_signin_input():
     return jsonify({'status': 'ok'})
 
 
-@tve_bp.route('/settings/tve/youtubetv-guide/browser-login/stop', methods=['POST'])
+@tve_bp.route('/settings/youtubetv/guide-signin/stop', methods=['POST'])
 def youtubetv_guide_signin_stop():
     from .tasks import stop_youtubetv_guide_signin
     stop_youtubetv_guide_signin()
