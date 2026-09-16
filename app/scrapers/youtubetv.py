@@ -62,19 +62,52 @@ up to _EPG_MAX_PAGES (~21h forward coverage); each page is a real ~1-1.5MB
 authenticated call so this is deliberately capped well under the API's own
 7-day max rather than exhausting it every scrape.
 
-Playback: NOT implemented — resolve() raises. Why this is a much bigger lift
-than every other DRM scraper in this codebase: the real web player delivers
-video over SABR (a proprietary binary protocol — POST + protobuf framing,
-response type application/vnd.yt-ump — not DASH/HLS Media3 can consume) and
-fetches the Widevine license through a custom Innertube envelope
-(player/get_drm_license), not a raw CDM-challenge passthrough. There IS an
-unused-looking fallback in the player response (a plain dashManifestUrl +
-manifest-embedded yt:SystemURL license hints — the exact simple shape every
-other scraper here uses) but it was never reachable for a real test: this
-account has no active YouTube TV subscription, so even an unrelated public
-video came back UNPLAYABLE through this app identity — expected/subscription-
-gated behavior, not a protocol failure. Revisit resolve() if/when a real
-subscription is available to test the fallback against.
+Playback: resolve() uses the plain dashManifestUrl + licenseInfos fallback —
+the exact simple shape (standard DASH/CENC manifest, standard Widevine
+license URL) every other DRM scraper here uses, so fc_player's ExoPlayer
+plays it with zero SABR/wrapped-envelope code. Confirmed real and correctly
+shaped 2026-09-16 from dev/yttv/3.har, captured during a real 20-minute YTTV
+free preview: the WEB_UNPLUGGED player() response (called via
+tv.youtube.com/youtubei/v1/player, authenticated with a real session cookie
++ SAPISIDHASH — same mechanism as _fetch_live_station_info() below, not
+anything new) carried BOTH a SABR serverAbrStreamingUrl (irrelevant, ignored)
+AND a properly-shaped dashManifestUrl
+(.../api/manifest-yttv/dash/.../source/yt_tv_broadcast/... with the real
+videoId) plus licenseInfos: [{"drmFamily": "WIDEVINE", "url":
+"https://www.youtube.com/api/drm/widevine?..."}] — a plain signed CDM-license
+URL, not the wrapped player/get_drm_license envelope the live web player
+actually used during that HAR capture (SABR apparently being preferred
+client-side even when this fallback is available).
+
+**The REAL gate is which videoId you ask about, not client identity, not
+session/click state.** Re-tested live 2026-09-16 after the free preview
+expired: the IDENTICAL WEB_UNPLUGGED/SAPISIDHASH call against a
+currently-airing program's EPG-derived videoId (airings[].videoId, what
+_current_video_id used to return) returns HTTP 200 / playabilityStatus OK,
+but with the generic broken shape (.../api/manifest/dash/.../source/youtube/
+... opaque id, no licenseInfos) — regardless of client identity, real vs
+fake session, cookies, multi-scheme auth, or clickTrackingParams (all tried
+and ruled out live the same day). That videoId is PROGRAM-level, not
+broadcast-level — a real, extensive live click-through test (real mouse
+clicks through the actual app, captured request/response pairs) initially
+looked like it proved this needed a live browser session, until reading a
+mirrored competitor reference implementation (dev/dvrtuner, gitignored)
+revealed the real distinction: YTTV has TWO different videoIds for "the same"
+live channel, program-level (source=youtube, what the EPG grid's
+airings[].videoId gives you, NEVER entitled no matter how the request is
+made) and broadcast-level (source=yt_tv_broadcast, what actually plays).
+_fetch_live_broadcast_video_ids() below sources the correct one from the
+"Live tab" carousel (browseId=FEunplugged_home) — confirmed live 2026-09-16
+to return real licenseInfos via a fully stateless call, zero browser or click
+involvement, the moment the right id is used instead of the EPG one.
+
+Entitlement (paid/trial subscription) is still real and still required —
+without it every videoId, broadcast or program, gets the same placeholder
+manifest. licenseInfos presence is the actual entitlement tell, not the
+source=yt_tv_broadcast/manifest-yttv substring (a wrong assumption from
+earlier the same day) — a legitimately entitled on-demand rerun came back
+with real licenseInfos on a plain source=youtube shape, since it's served as
+a regular catalog video rather than a live broadcast.
 """
 from __future__ import annotations
 
@@ -144,6 +177,20 @@ _EPG_GAP_FILL_MAX_PAGES = 3  # supplemental now-playing pass, see fetch_epg()
 # more airings per station within the same page budget). 90s picked as a
 # safely-in-the-peak, round value.
 _EPG_GAP_FILL_DURATION_MS = 90000
+
+# Playback (see module docstring). The real player() response reports
+# expiresInSeconds ~21540 (~5.98h) for the manifest/license pair; cache well
+# under that, matching Roku's "TTL below the JWT lifetime" reasoning in
+# roku.py. Keyed by station_id but invalidated whenever the current video_id
+# for that station changes (a program boundary), not on a bare timer alone.
+_PLAYBACK_TTL = 3600
+# Real signed CDM-license URL family seen in licenseInfos (dev/yttv/3.har,
+# see module docstring) -- a plain Widevine license server, not the wrapped
+# Innertube envelope. Used here only as a truthy "DRM-capable" class-level
+# sentinel (mirrors Roku's _WV_LICENSE_BASE); the real per-session URL
+# (with its signed query string) is cached per-station by resolve() and
+# returned by get_license_url() below.
+_WV_LICENSE_BASE = 'https://www.youtube.com/api/drm/widevine'
 
 # Static crosswalk: stationId -> (name, gracenote_id, logo_url). Rebuilt
 # 2026-09-16 from a REAL signed-in tv.youtube.com guide session (the
@@ -485,9 +532,24 @@ class YouTubeTVScraper(BaseScraper):
     source_category = 'premium'
     is_premium = True
     config_required = True  # needs its own Google sign-in done first (this source's own config panel)
-    under_development = True  # channel/EPG discovery only, no playback yet
+    # Playback (resolve(), see module docstring) is real now, but only actually
+    # works while this account holds live paid/trial YTTV entitlement -- keep
+    # the "under development" badge as an honest signal until that's reliably
+    # true, not just possible.
+    under_development = True
     scrape_interval = 720
-    stream_audit_enabled = False  # nothing resolvable to audit yet
+    # Every channel is DASH+Widevine (no plain-HLS fallback exists at all), same
+    # shape as directv/sling/nbc_tve/warner_tve -- see all_channels_require_drm_bridge
+    # below, which routes every channel straight into the FastChannels Player DRM
+    # bridge (ExoPlayer's native MediaDrm, not the YouTube TV app) immediately
+    # after scraping rather than waiting for a stream audit to discover it.
+    all_channels_require_drm_bridge = True
+    # Not yet enabled: a periodic audit would call resolve() on every channel on
+    # a timer regardless of whether this account currently holds live
+    # entitlement, generating constant "no active entitlement" noise while
+    # unsubscribed. Revisit once there's a reliable way to skip auditing during
+    # a known-unentitled window.
+    stream_audit_enabled = False
 
     def _bearer_token(self) -> str:
         saved = load_youtubetv_google_master_token()
@@ -736,7 +798,7 @@ class YouTubeTVScraper(BaseScraper):
                 name=name,
                 slug=f'youtubetv-{sid.lower()}',
                 stream_url=f'{SCHEME}{sid}',
-                stream_type='hls',
+                stream_type='dash',  # every YTTV channel is DASH+Widevine only, see resolve()
                 logo_url=logo_url,
                 category=category_for_channel(name, None, self.source_name) if (live or known) else None,
                 language='en',
@@ -891,9 +953,286 @@ class YouTubeTVScraper(BaseScraper):
             episode_id=video_id,
         )
 
+    license_url = _WV_LICENSE_BASE  # truthy DRM-capable signal; see get_license_url()
+
+    def _fetch_live_broadcast_video_ids(self, bearer: str) -> dict[str, str]:
+        """Real, current-airing BROADCAST-level videoIds, keyed by uppercased
+        network name. Confirmed live 2026-09-16 -- this is THE actual fix for
+        playback, not a session/click-gating problem at all (see module
+        docstring): the EPG grid's per-airing videoId (what _current_video_id
+        used to return alone) is a program-level id (source=youtube) that
+        NEVER carries real entitlement, no matter how the player() call is
+        made. The browseId=FEunplugged_home ("Live tab") carousel instead
+        surfaces the broadcast-level videoId (source=yt_tv_broadcast) --
+        confirmed to return real licenseInfos via a fully stateless call, zero
+        browser/click involvement, the moment the right id is used. Traced to
+        this exact fix by reading a mirrored competitor reference
+        implementation (dev/dvrtuner, gitignored) that made the same
+        program-vs-broadcast videoId distinction, though its own field for it
+        (a per-row navigationEndpoint.watchEndpoint.videoId) is gone from the
+        current API shape -- this Live-tab carousel is where that data lives
+        now. No direct stationId on these items (confirmed: 0/168 sampled),
+        so matched by name the same way dvrtuner's own fallback does: the
+        network name is the first bullet-separated segment of secondaryText.
+        Not exhaustive -- this is a personalized/algorithmic ~150-200 item
+        carousel, not a full 238-station listing, so not every channel will
+        have a current entry; callers should treat a miss as "no live
+        broadcast id available right now", not an error."""
+        data = self._api_call(bearer, 'unplugged/browse', {'browseId': 'FEunplugged_home', 'params': 'CAI%3D'})
+
+        def _text(obj: dict) -> str:
+            if not obj:
+                return ''
+            eas = obj.get('elementsAttributedString', {})
+            if eas.get('content'):
+                return eas['content']
+            if obj.get('simpleText'):
+                return obj['simpleText']
+            runs = obj.get('runs', [])
+            return ''.join(r.get('text', '') for r in runs) if runs else ''
+
+        result: dict[str, str] = {}
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                model = obj.get('unpluggedHomeVideoItemModel')
+                if model:
+                    vi = model.get('videoItem', {})
+                    vid = vi.get('videoId')
+                    secondary = _text(vi.get('secondaryText', {}))
+                    network = secondary.split('•')[0].strip().upper() if secondary else ''
+                    if vid and network and network not in result:
+                        result[network] = vid
+                for v in obj.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+
+        walk(data)
+        return result
+
+    def _current_video_id(self, station_id: str) -> str | None:
+        """Resolves the CURRENT broadcast-level videoId for a station (the id
+        that actually carries entitlement -- see
+        _fetch_live_broadcast_video_ids's docstring). Tries the Live tab
+        first (matched by name, with a last-word-dropped fallback for minor
+        naming differences like "NBC 4" vs "NBC"); falls back to the EPG's
+        own per-airing videoId only if the Live tab has no current entry for
+        this channel -- that fallback is known to be unentitled for live
+        content, but harmless to try (resolve() validates the response shape
+        either way, so a bad id just surfaces as a clear error, not silent
+        failure)."""
+        from ..models import Channel, Program
+        channel = (
+            Channel.query.join(Source)
+            .filter(Source.name == self.source_name, Channel.source_channel_id == station_id)
+            .first()
+        )
+        if not channel:
+            return None
+
+        try:
+            bearer = self._bearer_token()
+            broadcast_map = self._fetch_live_broadcast_video_ids(bearer)
+            name_upper = (channel.name or '').upper().strip()
+            video_id = broadcast_map.get(name_upper)
+            if not video_id and ' ' in name_upper:
+                video_id = broadcast_map.get(name_upper.rsplit(' ', 1)[0])
+            if video_id:
+                return video_id
+        except Exception as exc:  # noqa: BLE001
+            logger.info('[youtubetv] Live tab broadcast-id lookup failed for %s (falling back to EPG videoId): %s',
+                        channel.name, exc)
+
+        now = datetime.now(timezone.utc)
+        program = (
+            Program.query
+            .filter(Program.channel_id == channel.id,
+                    Program.start_time <= now, Program.end_time >= now,
+                    Program.episode_id.isnot(None))
+            .order_by(Program.start_time.desc())
+            .first()
+        )
+        return program.episode_id if program else None
+
+    def _fetch_web_unplugged_player(self, video_id: str) -> dict | None:
+        """Replicates the real web client's own authenticated player() call —
+        same cookie-read + SAPISIDHASH mechanism as _fetch_live_station_info()
+        above, just a different endpoint. Returns the raw JSON body, or None
+        if the guide profile isn't signed in / cookies unreadable (a network
+        or HTTP-status failure raises instead, since resolve() needs to
+        distinguish "not signed in" from "signed in but not entitled")."""
+        try:
+            from camoufox.sync_api import Camoufox
+        except ImportError:
+            return None
+        try:
+            with Camoufox(
+                headless='virtual', os='windows', persistent_context=True,
+                user_data_dir=_YOUTUBETV_GUIDE_PROFILE_DIR,
+            ) as context:
+                cookies = context.cookies()
+        except Exception as exc:  # noqa: BLE001
+            logger.info('[youtubetv] resolve: could not read guide profile cookies '
+                        '(not signed in yet, or profile busy with another job): %s', exc)
+            return None
+
+        cookie_dict = {
+            c['name']: c['value'] for c in cookies
+            if 'youtube.com' in c.get('domain', '') or 'google.com' in c.get('domain', '')
+        }
+        sapisid = cookie_dict.get('SAPISID')
+        if not sapisid:
+            logger.info('[youtubetv] resolve: no SAPISID cookie — guide sign-in not completed')
+            return None
+
+        origin = 'https://tv.youtube.com'
+        ts = str(int(time.time()))
+        sapisidhash = hashlib.sha1(f'{ts} {sapisid} {origin}'.encode()).hexdigest()
+        body = {
+            'videoId': video_id,
+            'context': {'client': {
+                'hl': 'en', 'gl': 'US', 'clientName': 'WEB_UNPLUGGED',
+                'clientVersion': '1.20260914.02.00', 'osName': 'Windows', 'osVersion': '10.0',
+                'platform': 'DESKTOP', 'clientFormFactor': 'UNKNOWN_FORM_FACTOR',
+                'clientScreen': 'WATCH_FULL_SCREEN',
+                'unpluggedAppInfo': {'filterModeType': 'UNPLUGGED_FILTER_MODE_TYPE_NONE'},
+                'unpluggedLocationInfo': {'clientPermissionState': 2, 'timezone': 'America/New_York'},
+            }},
+            'playbackContext': {
+                'contentPlaybackContext': {
+                    'html5Preference': 'HTML5_PREF_WANTS', 'lactMilliseconds': '0',
+                    'referer': f'{origin}/watch/{video_id}', 'signatureTimestamp': 20702,
+                    'autoCaptionsDefaultOn': False,
+                },
+                'devicePlaybackCapabilities': {'supportsVp9Encoding': True, 'supportXhr': True},
+            },
+            'racyCheckOk': True, 'contentCheckOk': True, 'captionParams': {},
+        }
+        resp = self.session.post(
+            f'{origin}/youtubei/v1/player?prettyPrint=false', json=body,
+            headers={
+                'Authorization': f'SAPISIDHASH {ts}_{sapisidhash}',
+                'Content-Type': 'application/json',
+                'Cookie': '; '.join(f'{k}={v}' for k, v in cookie_dict.items()),
+                'Origin': origin, 'Referer': f'{origin}/watch/{video_id}',
+                'X-Origin': origin, 'X-Goog-AuthUser': '0',
+                'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                               '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'),
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _load_playback_cache(self) -> dict:
+        raw = self.cache.get('yttv_playback')
+        return raw if isinstance(raw, dict) else {}
+
+    def _cached_playback(self, station_id: str, video_id: str) -> dict | None:
+        entry = self._load_playback_cache().get(station_id)
+        if not isinstance(entry, dict):
+            return None
+        if entry.get('video_id') != video_id:
+            return None  # program changed since this was cached
+        cached_at = entry.get('cached_at')
+        if not isinstance(cached_at, (int, float)) or (time.time() - cached_at) >= _PLAYBACK_TTL:
+            return None
+        if not entry.get('dash_url'):
+            return None
+        return entry
+
+    def _cache_playback(self, station_id: str, video_id: str, dash_url: str, license_url: str | None) -> None:
+        playback = dict(self._load_playback_cache())
+        playback[station_id] = {
+            'video_id': video_id, 'dash_url': dash_url,
+            'license_url': license_url, 'cached_at': time.time(),
+        }
+        self._update_cache('yttv_playback', playback)
+
     def resolve(self, raw_url: str) -> str:
-        raise NotImplementedError(
-            'YouTube TV playback is not implemented yet (channel/EPG discovery '
-            'only) — see the youtubetv.py module docstring for why (SABR video '
-            'delivery + a wrapped Widevine license envelope, and no subscription '
-            'available yet to test the simpler unused fallback against).')
+        station_id = channel_id_for_url(raw_url)
+        if not station_id:
+            raise RuntimeError(f'YouTube TV: malformed stream_url: {raw_url}')
+
+        video_id = self._current_video_id(station_id)
+        if not video_id:
+            raise RuntimeError(
+                f'YouTube TV: no currently-airing program with a videoId for station {station_id} '
+                '(EPG data may be stale or this channel has no now-playing coverage right now)')
+
+        cached = self._cached_playback(station_id, video_id)
+        if cached:
+            return cached['dash_url']
+
+        try:
+            data = self._fetch_web_unplugged_player(video_id)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f'YouTube TV: player() request failed for {video_id}: {exc}') from exc
+        if not data:
+            raise RuntimeError(
+                'YouTube TV: not signed in — use "Sign in to YouTube TV guide" in this '
+                'source\'s own config panel (Sources -> YouTube TV -> Configure).')
+
+        ps = data.get('playabilityStatus', {})
+        if ps.get('status') != 'OK':
+            raise RuntimeError(
+                f'YouTube TV: video {video_id} not playable ({ps.get("status")}: '
+                f'{ps.get("reason")})')
+
+        sd = data.get('streamingData', {})
+        dash_url = sd.get('dashManifestUrl')
+        license_infos = sd.get('licenseInfos') or []
+        license_url = next(
+            (li.get('url') for li in license_infos if li.get('drmFamily') == 'WIDEVINE'), None)
+        # licenseInfos presence is the real entitlement signal, NOT a
+        # source=yt_tv_broadcast/manifest-yttv substring check (an earlier,
+        # wrong assumption here) -- confirmed live 2026-09-16: a legitimately
+        # entitled on-demand rerun (e.g. a "released N days ago" video from
+        # the Live tab, served as a regular catalog video, not a live
+        # broadcast) came back with real licenseInfos but a plain
+        # source=youtube manifest shape. The un-entitled placeholder manifest
+        # this scraper hits when using the wrong (program-level) videoId has
+        # NO licenseInfos at all -- that's the actual, reliable tell.
+        if not dash_url or not license_url:
+            raise RuntimeError(
+                'YouTube TV: this account has no active entitlement for this content right now — '
+                'the API returned a manifest with no license info (this is expected without an '
+                'active paid/trial subscription, or if this specific program needs a plan this '
+                'account does not have; see the module docstring).')
+
+        self._cache_playback(station_id, video_id, dash_url, license_url)
+        return dash_url
+
+    @classmethod
+    def license_request_headers(cls, config: dict) -> dict:
+        # UNVERIFIED against a real license POST (never captured one — the real
+        # web player used SABR's wrapped envelope during the only real-subscription
+        # HAR capture, not this fallback). These are the standard headers every
+        # googlevideo/youtube.com endpoint expects; the license URL itself is a
+        # signed, self-contained token (sig/sparams in the query string), so no
+        # separate auth header is expected to be required. Revisit if a real
+        # entitlement window shows this needs adjustment.
+        return {
+            'Origin': 'https://tv.youtube.com',
+            'Referer': 'https://tv.youtube.com/',
+            'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                           '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'),
+        }
+
+    @classmethod
+    def get_license_url(cls, config: dict, channel_id: str | None = None) -> str | None:
+        """Per-session Widevine license URL cached by resolve(), keyed by station.
+        With no channel_id, returns the bare sentinel as a truthy "DRM-capable"
+        signal only. With a channel_id, returns the cached per-session signed URL,
+        or None if resolve() hasn't been called yet for the current program (never
+        the tokenless base — an unsigned request to Google's real license server
+        would just fail)."""
+        if channel_id:
+            entry = (config.get('yttv_playback') or {}).get(channel_id)
+            if isinstance(entry, dict) and entry.get('license_url'):
+                return entry['license_url']
+            return None
+        return cls.license_url

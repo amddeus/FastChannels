@@ -10,11 +10,19 @@ tv.youtube.com's own login check (redirects to /welcome?rd_rsn=lo, i.e.
 session on disk, by navigating to the guide itself and doing a real
 interactive login there.
 
-Reuses the existing _YOUTUBETV_ISOLATED_PROFILE_DIR
-(/data/browser_profiles/youtubetv) that the NBC/FOX YouTubeTV-as-MVPD
-pairing flows already use for their own (unrelated) Adobe Pass purpose —
-same account, so a real login here also refreshes that session for them,
-not just for app.scrapers.youtubetv.
+Uses _YOUTUBETV_ISOLATED_PROFILE_DIR (/data/browser_profiles/youtubetv) —
+the SAME profile run_youtubetv_google_signin() below (this scraper's "Sign
+in with Google" step) also uses, deliberately, as of 2026-09-16. The two
+steps used to live on different profiles (this one here, "Sign in with
+Google" on the TVE feature's shared mvpd_tve profile) with a cross-profile
+"priming" call bridging them — confirmed live 2026-09-16 as a real bug: it
+silently carried the TVE feature's OWN saved Google account into this flow
+with no login form ever shown, making it impossible to switch this scraper
+to a different Google account than whatever TVE happened to have on file.
+Now both steps share one dedicated, TVE-independent profile: sign in via
+either step and the other naturally sees the same session already there —
+no explicit priming code needed, and switching accounts (wipe this one
+profile dir, sign in again) is unambiguous and complete.
 """
 import logging
 import time
@@ -27,7 +35,6 @@ from app.tve.browser_login.common import (
     _YOUTUBETV_ISOLATED_PROFILE_DIR,
     _YOUTUBETV_CAMOUFOX_FIREFOX_PREFS,
     _autofill_google_account_chooser,
-    _prime_google_session,
     _safe_page_url,
     _relay_input_and_screenshot,
     _BrowserSessionDied,
@@ -111,13 +118,55 @@ def run_youtubetv_guide_signin():
                 user_data_dir=_YOUTUBETV_ISOLATED_PROFILE_DIR, window=(1280, 800),
                 firefox_user_prefs=_YOUTUBETV_CAMOUFOX_FIREFOX_PREFS,
             ) as context:
-                _prime_google_session(context, 'YouTubeTV')
                 page = context.pages[0] if context.pages else context.new_page()
                 page.on('crash', lambda p: logger.warning('[yttv-guide-signin] page CRASH event fired (url was %s)', _safe_page_url(p)))
                 page.on('close', lambda p: logger.warning('[yttv-guide-signin] page CLOSE event fired'))
                 page.on('pageerror', lambda exc: logger.warning('[yttv-guide-signin] page JS error: %s', str(exc)[:500]))
 
-                page.goto(_GUIDE_URL, wait_until='domcontentloaded', timeout=30000)
+                # Navigate straight to Google's standard sign-in entry point
+                # with a continue= URL back to the guide, rather than
+                # tv.youtube.com/live itself. Confirmed live 2026-09-16 TWICE
+                # (once in scripted testing, once against a real user's real
+                # relayed click): a signed-out profile visiting /live lands on
+                # tv.youtube.com's /welcome marketing page, and its "Sign in"
+                # button is unreliable -- worked once, then silently failed to
+                # navigate on a later attempt with no code change, and also
+                # failed to fire on a real human's real relayed mouse click
+                # (confirmed via a live screenshot: the page was still sitting
+                # on /welcome's auto-playing carousel, completely unmoved,
+                # long after the click was sent and relayed successfully).
+                # This URL is the same standard Google OAuth entry any real
+                # "sign in with Google" link uses, reaches the identical
+                # accounts.google.com login form deterministically (no
+                # /welcome, no flaky button dependency at all), and its own
+                # continue= param redirects back to the guide on success.
+                #
+                # UPDATE, same session: a direct continue=tv.youtube.com/live
+                # reached the login form fine but, after a real sign-in,
+                # redirected back to /welcome instead of the guide -- Google
+                # authenticated the browser, but tv.youtube.com's OWN session
+                # recognition apparently isn't satisfied by landing there
+                # directly. The real "Sign in" button's own continue chain
+                # (captured from an actual click earlier this session) hops
+                # through m.youtube.com/signin first:
+                #   continue=m.youtube.com/signin?action_handle_signin=true
+                #     &feature=upg_web_login&skip_identity_prompt=True&hl=en
+                #     &next=<tv.youtube.com URL>
+                # That handoff page is presumably what actually establishes
+                # tv.youtube.com's own session cookie/state, not just Google's
+                # account-level login -- reproduced verbatim here rather than
+                # jumping straight to /live.
+                from urllib.parse import quote as _quote
+                _next_url = 'https://tv.youtube.com/?utm_servlet=prod&rd_rsn=lo&onboard=2'
+                _mobile_signin = (
+                    'http://m.youtube.com/signin?action_handle_signin=true&feature=upg_web_login'
+                    f'&skip_identity_prompt=True&hl=en&next={_quote(_next_url, safe="")}'
+                )
+                signin_url = (
+                    'https://accounts.google.com/ServiceLogin?service=youtube'
+                    f'&continue={_quote(_mobile_signin, safe="")}&hl=en'
+                )
+                page.goto(signin_url, wait_until='commit', timeout=30000)
                 set_status('running', 'Sign in below, including any 2FA/captcha if shown.', page.url)
 
                 wait_started = time.monotonic()
@@ -158,13 +207,32 @@ def run_youtubetv_guide_signin():
                     # (page.url only reaches tv.youtube.com after that's
                     # done) or spin tightly if something else is wrong.
                     try:
-                        on_youtube = 'tv.youtube.com' in (page.url or '')
+                        # Real hostname check, NOT a raw substring search --
+                        # confirmed live 2026-09-16 as a real, active bug: the
+                        # sign-in URL above embeds "tv.youtube.com" as literal
+                        # text inside its own continue= query parameter (only
+                        # the surrounding punctuation gets percent-encoded,
+                        # not the hostname text itself), so a naive `in`
+                        # check matched while STILL on accounts.google.com's
+                        # login page and forced a re-navigation back to
+                        # /live every 3s before the user had even finished
+                        # signing in -- which, since nothing was authenticated
+                        # yet, just bounced straight back to /welcome. Looked
+                        # exactly like "clicking the login field sends me back
+                        # to the splash page" but was actually on a timer,
+                        # unrelated to any click.
+                        from urllib.parse import urlparse as _urlparse
+                        on_youtube = (_urlparse(page.url or '').hostname or '') == 'tv.youtube.com'
                     except Exception:  # noqa: BLE001
                         on_youtube = False
                     if on_youtube and (now - last_renav) > 3.0:
                         last_renav = now
                         try:
-                            page.goto(_GUIDE_URL, wait_until='domcontentloaded', timeout=15000)
+                            # 'commit' not 'domcontentloaded' -- see the
+                            # comment on the initial goto above; the same
+                            # lifecycle-hang risk applies to any tv.youtube.com
+                            # navigation, not just the very first one.
+                            page.goto(_GUIDE_URL, wait_until='commit', timeout=15000)
                         except Exception as exc:  # noqa: BLE001
                             logger.info('[yttv-guide-signin] re-navigation to guide failed (will retry): %s', exc)
                     page.wait_for_timeout(200)
@@ -218,17 +286,20 @@ def _record_guide_signin_success() -> None:
 # -- see app.scrapers.youtubetv.load_youtubetv_google_master_token's
 # docstring for the full reasoning. Otherwise near-identical to
 # run_google_signin(): same Google embedded device-setup page, same
-# oauth_token-cookie capture, same shared mvpd_tve profile (sharing that
-# profile is fine -- it's just where the browser session lives, not a TVE
-# dependency; only the CAPTURED TOKEN's storage location matters for
-# separation).
+# oauth_token-cookie capture -- but uses _YOUTUBETV_ISOLATED_PROFILE_DIR (the
+# SAME profile run_youtubetv_guide_signin() above uses), NOT the TVE
+# feature's shared mvpd_tve profile. Changed 2026-09-16 -- sharing mvpd_tve
+# was the root cause of a real bug (see the module docstring): it made this
+# step, and the guide-signin step above, silently carry over whatever
+# Google account the separate TVE feature happened to have on file, with no
+# way to pick a different one for just this scraper. Both steps now live on
+# one dedicated, TVE-independent profile.
 GOOGLE_SIGNIN_STATUS_KEY = 'youtubetv-google:browser-login:status'
 GOOGLE_SIGNIN_SHOT_KEY = 'youtubetv-google:browser-login:screenshot'
 GOOGLE_SIGNIN_INPUT_KEY = 'youtubetv-google:browser-login:input'
 GOOGLE_SIGNIN_STOP_KEY = 'youtubetv-google:browser-login:stop'
 GOOGLE_SIGNIN_HINT_KEY = 'youtubetv-google:browser-login:hint'
 _GOOGLE_SIGNIN_TIMEOUT_SECONDS = 600
-_MVPD_TVE_PROFILE_DIR = '/data/browser_profiles/mvpd_tve'
 
 
 def run_youtubetv_google_signin():
@@ -282,10 +353,10 @@ def run_youtubetv_google_signin():
 
         try:
             import os as _os_login
-            _os_login.makedirs(_MVPD_TVE_PROFILE_DIR, exist_ok=True)
+            _os_login.makedirs(_YOUTUBETV_ISOLATED_PROFILE_DIR, exist_ok=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning('[youtubetv-google-signin] could not create profile dir %s: %s',
-                            _MVPD_TVE_PROFILE_DIR, exc)
+                            _YOUTUBETV_ISOLATED_PROFILE_DIR, exc)
 
         _ctx.pop()
         _ctx_popped['v'] = True
@@ -294,7 +365,8 @@ def run_youtubetv_google_signin():
         try:
             with Camoufox(
                 headless='virtual', os='windows', persistent_context=True,
-                user_data_dir=_MVPD_TVE_PROFILE_DIR, window=(1280, 800),
+                user_data_dir=_YOUTUBETV_ISOLATED_PROFILE_DIR, window=(1280, 800),
+                firefox_user_prefs=_YOUTUBETV_CAMOUFOX_FIREFOX_PREFS,
             ) as context:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.on('crash', lambda p: logger.warning('[youtubetv-google-signin] page CRASH event fired (url was %s)', _safe_page_url(p)))

@@ -2114,6 +2114,72 @@ def sling_dash_proxy(channel_id: str):
     )
 
 
+@play_bp.route('/play/youtubetv/<channel_id>/dash.mpd')
+def youtubetv_dash_proxy(channel_id: str):
+    """DASH (Widevine) manifest proxy for a YouTube TV channel.
+
+    Exists because Media3's DefaultMediaSourceFactory auto-detects HLS vs
+    DASH purely from the request URL's own extension (.m3u8 vs .mpd) --
+    confirmed live 2026-09-16: the generic /play/youtubetv/<id>.m3u8 route
+    (what every non-special-cased source uses) made fc_player's ExoPlayer try
+    to parse a real DASH manifest as an HLS playlist and fail immediately
+    (HlsPlaylistParser: "Input does not start with the #EXTM3U header").
+    youtubetv's resolve() returns a real googlevideo.com manifest URL with no
+    recognizable extension at all (.../playback, no .mpd/.m3u8 suffix), so
+    there was no dash-shaped URL anywhere in the chain for Media3 to sniff --
+    unlike every other DASH DRM source here, which either has this same kind
+    of dedicated .../dash.mpd route already, or (DirecTV) an inherently
+    extension-bearing resolved URL. Proxies the manifest body (not just a
+    redirect) to match every sibling dash.mpd route's shape, so a future
+    browser/PrismCast use of this source needs no extra CORS work."""
+    channel = (
+        Channel.query
+        .join(Source)
+        .filter(Source.name == 'youtubetv', Channel.source_channel_id == channel_id)
+        .first()
+    )
+    if not channel:
+        abort(404)
+
+    scraper_cls = registry.get('youtubetv')
+    if not scraper_cls:
+        return _unavailable_response()
+    scraper = scraper_cls(config=channel.source.config or {})
+    try:
+        dash_url = scraper.resolve(channel.stream_url)
+    except Exception as e:
+        logger.warning('[youtubetv-dash] resolve failed for %s: %s', channel_id, e)
+        return _unavailable_response()
+    finally:
+        from ..extensions import db
+        if getattr(scraper, '_pending_cache_updates', None):
+            try:
+                persist_source_cache_updates(channel.source_id, scraper._pending_cache_updates)
+            except Exception as ce:
+                db.session.rollback()
+                logger.warning('[youtubetv-dash] failed to persist cache updates: %s', ce)
+
+    if not dash_url or not dash_url.startswith('http'):
+        logger.warning('[youtubetv-dash] no DASH URL for %s', channel_id)
+        return _unavailable_response()
+
+    try:
+        r = _requests.get(dash_url, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        logger.warning('[youtubetv-dash] manifest fetch failed for %s: %s', channel_id, e)
+        return _unavailable_response()
+
+    return Response(
+        r.text,
+        mimetype='application/dash+xml',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Access-Control-Allow-Origin': '*',
+        },
+    )
+
+
 @play_bp.route('/play/vidaa/<channel_id>/dash.mpd')
 def vidaa_dash_proxy(channel_id: str):
     """DASH (Widevine) manifest proxy for Vidaa's DRM tiles, for the watch page
