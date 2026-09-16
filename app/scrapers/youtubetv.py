@@ -135,6 +135,15 @@ _EPG_MAX_PAGES = 8  # ~4.3h + 7*2.4h =~ 21h forward coverage; each page is a rea
                      # ~1-1.5MB authenticated call, so this is deliberately capped
                      # well under the 7-day max rather than exhausting it every scrape.
 _EPG_GAP_FILL_MAX_PAGES = 3  # supplemental now-playing pass, see fetch_epg()
+# Confirmed live 2026-09-16 this is NOT "smaller is safer" -- 0 (the original
+# value) was actually the WORST choice, covering only ~76/238 channels'
+# current airing. Empirically swept 0/20s/45s/90s/150s/300s/600s: coverage
+# climbs to a peak around 90-150s (~216-217/238, ~91%) then drops back down
+# at 300s+ (~160-163/238) -- a real non-monotonic sweet spot, not "more is
+# always better" (larger windows apparently trade off station breadth for
+# more airings per station within the same page budget). 90s picked as a
+# safely-in-the-peak, round value.
+_EPG_GAP_FILL_DURATION_MS = 90000
 
 # Static crosswalk: stationId -> (name, gracenote_id, logo_url). Rebuilt
 # 2026-09-16 from a REAL signed-in tv.youtube.com guide session (the
@@ -748,15 +757,20 @@ class YouTubeTVScraper(BaseScraper):
         #    varying initialEpgFetchDurationMs and watching where each
         #    station's first returned airing lands; not a pagination-loop bug,
         #    the very first real page already starts that late.
-        # 2. Small gap-fill pass (initialEpgFetchDurationMs=0) specifically to
-        #    catch the currently-airing program. This does NOT reach all 236
-        #    stations no matter how many pages are fetched (confirmed: 3 pages
-        #    and 8 pages both topped out around 94-95/236) -- appears to be a
-        #    real characteristic of this endpoint, not a page-count limit, so
-        #    a handful of channels will legitimately show only their next
-        #    upcoming airing instead of what's on right now.
+        # 2. Small gap-fill pass (_EPG_GAP_FILL_DURATION_MS) specifically to
+        #    catch the currently-airing program. duration=0 (the original
+        #    value) was tried first and looked like a hard ceiling around
+        #    94-95/236 no matter how many pages were fetched -- but that
+        #    turned out to be duration=0 itself being a bad value, not an
+        #    endpoint limit: confirmed live 2026-09-16 that a small NONZERO
+        #    duration (see _EPG_GAP_FILL_DURATION_MS's own comment for the
+        #    full sweep) covers ~216-217/238 (~91%), more than double. A
+        #    residual handful of channels still won't have "now" covered on
+        #    any given scrape and will show their next upcoming airing
+        #    instead -- that remainder looks like real endpoint behavior, not
+        #    a parameter to keep chasing.
         programs, pages1 = self._fetch_epg_pass(bearer, wanted, _EPG_INITIAL_DURATION_MS, _EPG_MAX_PAGES)
-        gap_fill, pages2 = self._fetch_epg_pass(bearer, wanted, 0, _EPG_GAP_FILL_MAX_PAGES)
+        gap_fill, pages2 = self._fetch_epg_pass(bearer, wanted, _EPG_GAP_FILL_DURATION_MS, _EPG_GAP_FILL_MAX_PAGES)
 
         seen: set[tuple] = set()
         merged: list[ProgramData] = []
