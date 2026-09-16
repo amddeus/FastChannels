@@ -1,5 +1,6 @@
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+import math
 import re
 import unicodedata
 from urllib.parse import urlsplit
@@ -558,7 +559,10 @@ def sources():
             purge_at = missing_since + timedelta(days=_SCRAPER_MISSING_GRACE_DAYS)
             source_retired[s.id] = {
                 'purge_at': purge_at.isoformat(),
-                'days_left': max(0, (purge_at - _now).days),
+                # ceil, not floor: timedelta.days truncates, so a source with
+                # 22 hours left (still short of the actual purge) would floor
+                # to "0 days" — reading as "due today" a full day early.
+                'days_left': max(0, math.ceil((purge_at - _now).total_seconds() / 86400)),
             }
 
     # Channel-fetch freshness: only meaningful for sources that fetch the channel
