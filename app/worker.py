@@ -1862,12 +1862,15 @@ def _refresh_xml_artifacts() -> None:
 
 def _refresh_xml_artifacts_job() -> None:
     # Forked child inherits the parent's root logger handlers.  Reset to a
-    # single clean StreamHandler so the child never double-logs.
+    # single clean StreamHandler so the child never double-logs, then
+    # re-attach the shared log file so /admin/logs sees this job's output too
+    # (it otherwise only reached `docker logs` via stdout).
     logging.root.handlers = []
     _h = logging.StreamHandler(sys.stdout)
     _h.setFormatter(make_tz_formatter('%(asctime)s %(levelname)-8s %(name)s: %(message)s'))
     logging.root.setLevel(logging.INFO)
     logging.root.addHandler(_h)
+    _setup_logfile()
     with flask_app.app_context():
         # The forked child inherits the parent's SQLAlchemy connection pool,
         # and SQLite connections must never be used across a fork.  Replace
