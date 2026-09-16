@@ -28,20 +28,28 @@ contents.epgRenderer.paginationRenderer.epgPaginationRenderer
 reference implementation (dev/dvrtuner, gitignored) that expected names/logos
 inline on each row via `station.epgStationRenderer` — that shape is gone;
 current rows are bare `stationId` (a YouTube channel ID) with nothing else.
-Real per-channel names/logos come from `_STATION_CROSSWALK` below (a baked-in
-static lookup, not a live call per scrape — see its own comment for
-provenance) — 100% of live stations covered as of the 2026-09-16 rebuild,
-sourced from a REAL signed-in tv.youtube.com guide session (see
-app/tve/browser_login/youtubetv_guide.py's run_youtubetv_guide_signin) by
-capturing the browser's own natural unplugged/browse network response while
-it rendered the guide, using the fallback chain real clients use
-(name.runs -> callSign.runs -> icon/secondaryIcon accessibility label) for
-stations whose `name` field is empty in this response shape. A plain public
-youtube.com/channel/<id> page does NOT work as a resolution method on its own
-(confirmed: these stationIds are internal-only entities with no real public
-channel page) — the signed-in guide capture is what actually works. Gracenote
-IDs are a separate, narrower data source (a user-supplied list, see the
-crosswalk's own comment) and still only cover a subset.
+Real per-channel names/logos: fetch_channels() tries a LIVE lookup first
+(_fetch_live_station_info()) — replicates the real web client's own
+authenticated browseId=FEunplugged_epg + epgOptions call directly via
+requests, using cookies read from the signed-in guide profile
+(_YOUTUBETV_GUIDE_PROFILE_DIR, populated by
+app/tve/browser_login/youtubetv_guide.py's run_youtubetv_guide_signin) plus a
+locally-computed SAPISIDHASH — the same auth scheme the browser's own JS
+computes for itself, not anything defeating a protection (it's this
+account's own already-authorized session). No browser render needed, ~3-5s
+total; confirmed live 2026-09-16 returning all 238/238 stations fresh. Falls
+back to `_STATION_CROSSWALK` below (a baked-in static snapshot from the same
+technique, one-off, 2026-09-16) on ANY failure — no guide sign-in yet,
+expired session, profile busy with another browser-login job, network error
+— so a scrape never hard-fails over this, it just risks slightly stale
+names/logos on that one run. Both paths use the same fallback chain real
+clients use for the name itself (name.runs -> callSign.runs ->
+icon/secondaryIcon accessibility label) for stations whose `name` field is
+empty in this response shape. A plain public youtube.com/channel/<id> page
+does NOT work as a resolution method on its own (confirmed: these stationIds
+are internal-only entities with no real public channel page). Gracenote IDs
+have no live source at all — always come from the static crosswalk (a
+user-supplied list, see its own comment) and still only cover a subset.
 
 EPG: fetch_epg() uses the SAME browseId=FEunplugged_epg call, but with an
 `unpluggedBrowseOptions.epgOptions` body field the channel-discovery call above
@@ -70,6 +78,7 @@ subscription is available to test the fallback against.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from datetime import datetime, timezone
@@ -85,6 +94,10 @@ logger = logging.getLogger(__name__)
 
 SCHEME = 'youtubetv://'
 INNERTUBE_HOST = 'https://youtubei.googleapis.com/youtubei/v1'
+# Same path as _YOUTUBETV_ISOLATED_PROFILE_DIR in app/tve/browser_login/common.py
+# -- duplicated as a literal here rather than imported, so this module doesn't
+# pull in browser_login's heavier import chain just for one path string.
+_YOUTUBETV_GUIDE_PROFILE_DIR = '/data/browser_profiles/youtubetv'
 CLIENT_CONTEXT = {
     'client': {
         'clientName': 'ANDROID_UNPLUGGED',
@@ -563,34 +576,163 @@ class YouTubeTVScraper(BaseScraper):
             logger.warning('[youtubetv] EPG grid pagination hit the %d-page safety cap', _MAX_EPG_PAGES)
         return station_ids
 
+    def _fetch_live_station_info(self) -> dict[str, dict[str, str | None]] | None:
+        """Live per-scrape replacement for the baked-in _STATION_CROSSWALK's
+        name/logo data (gracenote_id has no live source — always comes from
+        the static crosswalk). Same technique as the one-off 2026-09-16
+        capture that built that crosswalk in the first place, just automated:
+        replicate the real web client's own authenticated
+        browseId=FEunplugged_epg + epgOptions call directly via requests,
+        using cookies read from the signed-in guide profile
+        (_YOUTUBETV_GUIDE_PROFILE_DIR) plus a locally-computed SAPISIDHASH —
+        the same auth scheme the browser's own JS computes, not anything
+        defeating a protection (it's this account's own already-authorized
+        session). No browser render needed, ~3-4s total. Returns None on any
+        failure (no signed-in session, expired cookies, network error,
+        unexpected response shape) so fetch_channels() can fall back to the
+        static crosswalk — this is best-effort freshness, not a hard
+        requirement to scrape at all.
+        """
+        try:
+            from camoufox.sync_api import Camoufox
+        except ImportError:
+            return None
+        try:
+            with Camoufox(
+                headless='virtual', os='windows', persistent_context=True,
+                user_data_dir=_YOUTUBETV_GUIDE_PROFILE_DIR,
+            ) as context:
+                cookies = context.cookies()
+        except Exception as exc:  # noqa: BLE001
+            logger.info('[youtubetv] live station-info: could not read guide profile cookies '
+                        '(not signed in yet, or profile busy with another job): %s', exc)
+            return None
+
+        cookie_dict = {
+            c['name']: c['value'] for c in cookies
+            if 'youtube.com' in c.get('domain', '') or 'google.com' in c.get('domain', '')
+        }
+        sapisid = cookie_dict.get('SAPISID')
+        if not sapisid:
+            logger.info('[youtubetv] live station-info: no SAPISID cookie — guide sign-in '
+                        'not completed or session expired, falling back to the static crosswalk')
+            return None
+
+        origin = 'https://tv.youtube.com'
+        ts = str(int(time.time()))
+        sapisidhash = hashlib.sha1(f'{ts} {sapisid} {origin}'.encode()).hexdigest()
+        body = {
+            'browseId': 'FEunplugged_epg',
+            'unpluggedBrowseOptions': {'epgOptions': {
+                'maxAiringsPerStation': 1,
+                'initialEpgFetchStartTimeMs': str(int(time.time() * 1000)),
+                'initialEpgFetchDurationMs': 60000,
+                'paginationDurationMs': _EPG_PAGINATION_DURATION_MS,
+                'maxDurationMs': _EPG_MAX_DURATION_MS,
+            }},
+            'context': {'client': {
+                'hl': 'en', 'gl': 'US', 'clientName': 'WEB_UNPLUGGED',
+                'clientVersion': '1.20260913.03.00', 'platform': 'DESKTOP',
+            }},
+        }
+        try:
+            resp = self.session.post(
+                f'{origin}/youtubei/v1/browse?alt=json', json=body,
+                headers={
+                    'Authorization': f'SAPISIDHASH {ts}_{sapisidhash}',
+                    'Content-Type': 'application/json',
+                    'Cookie': '; '.join(f'{k}={v}' for k, v in cookie_dict.items()),
+                    'Origin': origin, 'Referer': f'{origin}/live',
+                    'X-Origin': origin, 'X-Goog-AuthUser': '0',
+                },
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.info('[youtubetv] live station-info: request failed (non-fatal): %s', exc)
+            return None
+
+        try:
+            rows = (
+                data.get('contents', {}).get('epgRenderer', {})
+                .get('paginationRenderer', {}).get('epgPaginationRenderer', {}).get('contents', [])
+            )
+        except AttributeError:
+            rows = []
+        if not rows:
+            logger.info('[youtubetv] live station-info: response had no station rows (non-fatal)')
+            return None
+
+        result: dict[str, dict[str, str | None]] = {}
+        for row_wrap in rows:
+            row = row_wrap.get('epgRowRenderer', {})
+            station = row.get('station', {}).get('epgStationRenderer', {})
+            sid = row.get('stationId') or station.get('stationId')
+            if not sid:
+                continue
+            name = None
+            for key in ('name', 'callSign'):
+                runs = station.get(key, {}).get('runs', [])
+                if runs and runs[0].get('text'):
+                    name = runs[0]['text']
+                    break
+            if not name:
+                for key in ('icon', 'secondaryIcon'):
+                    label = station.get(key, {}).get('accessibility', {}).get('accessibilityData', {}).get('label')
+                    if label:
+                        name = label
+                        break
+            if not name:
+                continue
+            thumbs = station.get('icon', {}).get('thumbnails', [])
+            logo = thumbs[-1]['url'] if thumbs else None
+            if logo and logo.startswith('//'):
+                logo = 'https:' + logo
+            result[sid] = {'name': name, 'logo_url': logo}
+        return result or None
+
     def fetch_channels(self) -> list[ChannelData]:
         bearer = self._bearer_token()
         station_ids = self._fetch_station_ids(bearer)
         if not station_ids:
             logger.warning('[youtubetv] EPG grid returned no channels')
             return []
-        matched = sum(1 for sid in station_ids if sid in _STATION_CROSSWALK)
-        logger.info('[youtubetv] %d/%d stations matched the static name/gracenote crosswalk',
-                     matched, len(station_ids))
+
+        live_info = self._fetch_live_station_info()
+        if live_info:
+            logger.info('[youtubetv] live station-info fetch OK — %d stations, using in place of '
+                        'the static crosswalk for name/logo', len(live_info))
+        else:
+            logger.info('[youtubetv] live station-info unavailable this run — falling back to the '
+                        'static crosswalk (name/logo may be stale)')
+        matched = sum(
+            1 for sid in station_ids
+            if (live_info and sid in live_info) or sid in _STATION_CROSSWALK
+        )
+        logger.info('[youtubetv] %d/%d stations resolved a name', matched, len(station_ids))
 
         channels = []
         for sid in station_ids:
+            live = live_info.get(sid) if live_info else None
             known = _STATION_CROSSWALK.get(sid)
-            # No real name/logo comes back from the live grid itself (see
-            # module docstring) — fall back to the bare stationId for
-            # anything the crosswalk doesn't cover.
-            name = known['name'] if known else sid
+            # live_info has no gracenote_id (no live source for that data —
+            # see _STATION_CROSSWALK's own comment), so that always comes
+            # from the static crosswalk regardless of which name/logo won.
+            name = (live or known or {}).get('name') or sid
+            logo_url = (live or known or {}).get('logo_url')
+            gracenote_id = known.get('gracenote_id') if known else None
             channels.append(ChannelData(
                 source_channel_id=sid,
                 name=name,
                 slug=f'youtubetv-{sid.lower()}',
                 stream_url=f'{SCHEME}{sid}',
                 stream_type='hls',
-                logo_url=known.get('logo_url') if known else None,
-                category=category_for_channel(name, None, self.source_name) if known else None,
+                logo_url=logo_url,
+                category=category_for_channel(name, None, self.source_name) if (live or known) else None,
                 language='en',
                 country='US',
-                gracenote_id=known.get('gracenote_id') if known else None,
+                gracenote_id=gracenote_id,
             ))
         return channels
 
