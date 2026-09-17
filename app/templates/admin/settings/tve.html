@@ -43,10 +43,6 @@
             <div style="margin-top:0.3rem;color:var(--text-muted);font-size:0.78rem">One-time sign-in directly with Google — independent of any single network. Once signed in, every YouTube TV network below can authorize silently without opening a browser again.</div>
             <div style="margin-top:0.3rem;color:var(--text-muted);font-size:0.78rem">🧪 Beta — YouTube TV as a provider is less thoroughly tested than Xfinity/Comcast and Cox; entitlement and session refresh can be less reliable.</div>
           </div>
-          <div id="tve-youtubetv-guide-signin-row" style="display:none;margin-top:0.5rem">
-            <button class="btn btn-audit" type="button" onclick="openMvpdLoginModal('youtubetv-guide', null)">Sign in to YouTube TV guide</button>
-            <div style="margin-top:0.3rem;color:var(--text-muted);font-size:0.78rem">Separate from "Sign in with Google" above — this one signs in directly at tv.youtube.com so the YouTube TV channel scraper (app/scrapers/youtubetv.py) can read real channel names/logos straight from the guide page, the same way PrismCast does. Needed because a Google-only sign-in doesn't carry over to a real YouTube TV session.</div>
-          </div>
           <div id="tve-last-status" style="margin-top:0.55rem;color:var(--text-muted);font-size:0.82rem">
             {% if tve_account.last_auth_status %}
               Last test: {{ tve_account.last_auth_status }}{% if tve_account.last_auth_at %} at {{ tve_account.last_auth_at }}{% endif %}{% if tve_account.last_auth_message %} — {{ tve_account.last_auth_message }}{% endif %}

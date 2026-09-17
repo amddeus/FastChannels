@@ -470,22 +470,9 @@ def get_source_config(source_id):
         if config_complete else
         ('required' if scraper_cls and getattr(scraper_cls, 'config_required', False) else 'optional')
     )
-    # youtubetv's config panel is fully bespoke (no config_schema fields at
-    # all — see renderYoutubetvConfig in sources.html) and needs its own
-    # sign-in status surfaced here. Only the non-secret parts of
-    # google_master_token (email/captured_at) are exposed — never the token
-    # itself.
-    yttv_master_token = saved.get('google_master_token') or {}
-    yttv_google_public = (
-        {'email': yttv_master_token.get('email'), 'captured_at': yttv_master_token.get('captured_at')}
-        if yttv_master_token else None
-    )
     return jsonify({'schema': schema, 'values': values, 'config_complete': config_complete,
                     'config_status': config_status,
                     'oauth_token_time': saved.get('oauth_token_time'),
-                    'google_master_token': yttv_google_public,
-                    'google_signin_last_check': saved.get('google_signin_last_check'),
-                    'guide_signin_at': saved.get('guide_signin_at'),
                     'retired': retired})
 
 

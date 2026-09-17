@@ -572,13 +572,6 @@ def _get_playback_info(ch, fast_mode=True):
              or (ch.disable_reason or '').startswith('DRM'))
     )
 
-    # YouTube TV: every channel is DASH+Widevine, no plain-HLS fallback exists
-    # at all (unlike Roku/Fubo, where most channels are DRM-free) — see
-    # resolve() in youtubetv.py. stream_type is already 'dash' from the
-    # scraper, so no override needed here; only the license_url advertisement
-    # below needs special-casing, same reason as Roku/Fubo (see their comments).
-    yttv_drm = bool(ch.source and ch.source.name == 'youtubetv')
-
     # These sources use AES-128 encrypted TS; Shaka 4.x cannot decrypt via MSE
     # (error 4042). Force native mode so the watch page sets video.src directly
     # and lets the browser's native HLS stack handle decryption.
@@ -609,16 +602,6 @@ def _get_playback_info(ch, fast_mode=True):
                 # resolved and cached the per-channel token, which happens after
                 # this preview info is built. Advertise the proxy URL up front.
                 license_url = f'{_base}/play/fubo/license?channel_id={ch.source_channel_id}'
-            elif ch.source.name == 'youtubetv' and yttv_drm:
-                # Same reasoning again: youtubetv's playback cache lives in
-                # source_cache (per-station, per-video, populated by resolve()),
-                # not Source.config — calling get_license_url(ch.source.config)
-                # here would always see an empty cache and return None, since
-                # resolve() for THIS program hasn't necessarily run yet.
-                # Advertise the proxy URL up front; resolve() populates the
-                # cache it reads from by the time a client actually POSTs a
-                # challenge (the manifest fetch always happens first).
-                license_url = f'{_base}/play/youtubetv/license?channel_id={ch.source_channel_id}'
             else:
                 _lu = _scraper_cls.get_license_url(
                     ch.source.config or {},
@@ -650,19 +633,6 @@ def _get_playback_info(ch, fast_mode=True):
         play_url = preview_url
         playback_mode = 'hls'
         stream_type = 'hls'
-
-    if ch.source and ch.source.name == 'youtubetv' and ch.source_channel_id:
-        # Media3's DefaultMediaSourceFactory sniffs HLS vs DASH purely from
-        # the request URL's own extension -- the generic .m3u8 route above
-        # made fc_player's ExoPlayer try to parse a real DASH manifest as an
-        # HLS playlist and fail outright (confirmed live 2026-09-16, see
-        # youtubetv_dash_proxy's own docstring in play.py for the full
-        # story). Route through the dedicated dash.mpd proxy instead, same
-        # pattern every other DASH DRM source here uses.
-        from urllib.parse import quote as _quote
-        _enc = _quote(ch.source_channel_id, safe='')
-        play_url = f'/play/youtubetv/{_enc}/dash.mpd'
-        preview_url = play_url
 
     if ch.source and ch.source.name == 'directv' and ch.source_channel_id:
         from urllib.parse import quote as _quote
