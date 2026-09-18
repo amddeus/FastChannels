@@ -34,9 +34,15 @@ refresh_token itself has its own absolute ceiling tied to the original login
 countdown, not a sliding window that resets per refresh); once that's within
 _RELOGIN_BUFFER, app.worker's spectrum_relogin_watchdog job fires an
 unattended Camoufox re-login (check_relogin_due) using saved credentials
-against the same trusted persistent profile the manual button uses. Only if
-that can't complete on its own — e.g. credentials changed — does a scrape
-ever fall back to ScrapeSkipError pointing a human back to the button.
+against the same trusted persistent profile the manual button uses.
+_refresh_session also fires that same re-login REACTIVELY the instant a
+refresh comes back 401 — confirmed live 2026-09-18 the refresh_token can be
+invalidated well before refresh_ceiling_at's predicted deadline (e.g. a
+separate login attempt against the same account, even an abandoned one, can
+knock it out early), so waiting on the proactive watchdog alone isn't
+enough. Only if neither path can complete on its own — e.g. credentials
+changed — does a scrape ever fall back to ScrapeSkipError pointing a human
+back to the button.
 """
 from __future__ import annotations
 
@@ -186,6 +192,19 @@ class SpectrumScraper(BaseScraper):
             return False
         if not r.ok:
             logger.warning('[spectrum] token refresh rejected: HTTP %d', r.status_code)
+            if r.status_code == 401:
+                # A 401 here means the refresh_token itself was rejected
+                # outright, not just "not due for renewal yet" — confirmed
+                # live 2026-09-18 this can happen well before
+                # refresh_ceiling_at's predicted deadline (a separate login
+                # attempt against the same account, even an abandoned one,
+                # can invalidate the existing refresh_token early). Don't
+                # just wait for the proactive ceiling watchdog to notice —
+                # fire the same unattended re-login right away so the NEXT
+                # resolve()/scrape() call has a fresh session instead of a
+                # human needing to notice a 503 and hit the button.
+                if self._fire_unattended_relogin():
+                    logger.info('[spectrum] refresh_token was rejected outright — triggered unattended re-login')
             return False
         try:
             data = r.json()
@@ -213,28 +232,40 @@ class SpectrumScraper(BaseScraper):
         from any normal scrape/resolve path. _refresh_session can extend the
         access token indefinitely but only up to the refresh_token's own
         absolute ceiling (refresh_ceiling_at) — this decides whether that
-        ceiling is close enough to warrant firing an unattended re-login
-        through the same Camoufox flow the "Sign in to Spectrum" button uses,
-        and kicks it off async via trigger_spectrum_signin (never drives a
-        browser itself — that's Camoufox-only and doesn't belong on this
-        class). Device trust built up in the persistent mvpd_tve profile is
-        what let the original human-driven login past Spectrum's reCAPTCHA
-        Enterprise + ThreatMetrix gate (a genuinely fresh profile was
-        rejected outright), so an unattended run against that same profile is
-        expected to usually complete without a human. If it can't — changed
-        credentials, a new verification step — it simply times out like the
-        manual button would, and the next tick retries on cooldown until a
-        human intervenes; ScrapeSkipError's pointer back to the button
-        remains the ultimate fallback everywhere else in this scraper."""
-        username = (self.config.get('username') or '').strip()
-        password = (self.config.get('password') or '').strip()
-        if not username or not password:
-            return False
+        ceiling is close enough to warrant firing an unattended re-login via
+        _fire_unattended_relogin. This is the PROACTIVE half; _refresh_session
+        also fires the same trigger REACTIVELY the moment a refresh comes
+        back 401, since confirmed live 2026-09-18 the refresh_token can be
+        invalidated well before this ceiling predicts."""
         ceiling_at = self.config.get('refresh_ceiling_at')
         if not ceiling_at:
             return False
         remaining = float(ceiling_at) - time.time()
         if remaining > _RELOGIN_BUFFER:
+            return False
+        fired = self._fire_unattended_relogin()
+        if fired:
+            logger.info('[spectrum] refresh_token has %.1fh left before its ceiling — triggered unattended re-login', remaining / 3600)
+        return fired
+
+    def _fire_unattended_relogin(self) -> bool:
+        """Shared trigger-with-cooldown logic behind both check_relogin_due
+        (proactive, ceiling-based) and _refresh_session's reactive 401
+        handling. Fires the same Camoufox flow the "Sign in to Spectrum"
+        button uses, using saved credentials against the persistent trusted
+        profile — device trust built up there is what let the original
+        human-driven login past Spectrum's reCAPTCHA Enterprise + ThreatMetrix
+        gate (a genuinely fresh profile was rejected outright), so an
+        unattended run against that same profile is expected to usually
+        complete without a human. If it can't — changed credentials, a new
+        verification step — it simply times out like the manual button
+        would; _RELOGIN_COOLDOWN keeps either caller from re-firing a browser
+        login on every single resolve() call during an outage, and
+        ScrapeSkipError's pointer back to the button remains the ultimate
+        fallback everywhere else in this scraper."""
+        username = (self.config.get('username') or '').strip()
+        password = (self.config.get('password') or '').strip()
+        if not username or not password:
             return False
         last_attempt = float(self.config.get('auto_relogin_last_attempt_at') or 0)
         if time.time() - last_attempt < _RELOGIN_COOLDOWN:
@@ -243,7 +274,6 @@ class SpectrumScraper(BaseScraper):
         if not trigger_spectrum_signin():
             return False  # shared browser profile busy with another MVPD login — retry next tick
         self._update_config('auto_relogin_last_attempt_at', int(time.time()))
-        logger.info('[spectrum] refresh_token has %.1fh left before its ceiling — triggered unattended re-login', remaining / 3600)
         return True
 
     def _headers(self, extra: dict | None = None) -> dict:
