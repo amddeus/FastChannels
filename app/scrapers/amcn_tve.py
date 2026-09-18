@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import logging
 import re
 import time
 import uuid
@@ -25,6 +26,8 @@ from ..tve.adobe_pass import (
     _hidden_form,
     throttle_cox_login,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # AMC Networks TVE scraper.
@@ -680,6 +683,23 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
             r.raise_for_status()
             mso_login_url = ''
         if not mso_login_url and mso_id != 'DTV':
+            # Confirmed live 2026-09-18: Spectrum hits this same "no real
+            # redirect" shape DTV is already exempted for — a 200 with an
+            # auto-submit SAML form (onload="document.forms[0].submit()")
+            # instead of a 3xx. Unlike DTV, nothing downstream here drives
+            # that form — AMCN's browser-assisted loop
+            # (app/tve/browser_login/amcn.py) unconditionally does
+            # page.goto(mso_login_url, ...), which needs a real URL, and
+            # DTV's own handler for this exact shape (directv_login()) is a
+            # separate hand-rolled SCRIPTED form-parser the browser loop
+            # never calls. A real fix has the browser loop navigate straight
+            # to this response's own URL instead — the JS onload fires
+            # naturally in a real browser. Logged with the raw body so a
+            # future fix doesn't need to re-diagnose this from scratch.
+            logger.warning(
+                '[amcn-tve] no MVPD redirect for mso_id=%s: HTTP %d final_url=%s body[:300]=%r',
+                mso_id, r.status_code, r.url, r.text[:300],
+            )
             raise TVEAuthError(f'{channel.name}: Adobe did not return an MVPD login redirect.')
         return client, code, mso_login_url, auth_headers, r
 
