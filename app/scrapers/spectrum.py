@@ -15,9 +15,13 @@ call, not from any request/response body (confirmed live 2026-09-17).
 It's cached per-channel (stream_cache), same shape as Fubo's dash_cache,
 since it's minted per stream, not once per account.
 
-Access/refresh tokens are not renewed automatically — once the ~12h pair
-expires, calls raise ScrapeSkipError until a human signs in again via the
-browser button.
+The ~12h access token is refreshed silently via the OAuth refresh_token grant
+(_refresh_session, confirmed live 2026-09-17) whenever it's within
+_TOKEN_REFRESH_BUFFER of expiring — no browser/recaptcha needed for that. The
+refresh_token itself has its own absolute ceiling tied to the original login
+(observed ~24h, not a sliding window that resets per refresh); once that's
+passed, refresh attempts fail and ScrapeSkipError points back to the browser
+button for a fresh sign-in.
 """
 from __future__ import annotations
 
@@ -37,12 +41,14 @@ from ..tve.adobe_pass import TVENotAuthorizedError
 logger = logging.getLogger(__name__)
 
 _API_BASE = 'https://apis-vid.spectrum.net'
+_AUTH_BASE = 'https://apis.spectrum.net'
 _IMG_BASE = 'https://cdnimg.spectrum.net'
 _LICENSE_BASE = 'https://apis-drm.spectrum.net/drm/licenseServer/widevine/v2'
 _CLIENT_ID = 'stva-ovp'
 _CLIENT_VERSION = '17.32.0.289483649'
 _USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36')
+_TOKEN_REFRESH_BUFFER = 10 * 60  # refresh 10min before actual expiry, not exactly at it
 
 _MC_NAME_RE = re.compile(r'^~mc(\d+):?$')
 
@@ -122,10 +128,60 @@ class SpectrumScraper(BaseScraper):
                 '[spectrum] no session — use the source\'s "Sign in to Spectrum" '
                 'button (Camoufox, reCAPTCHA-gated) to authenticate.')
         expires_at = self.config.get('token_expires_at')
-        if expires_at and time.time() > float(expires_at):
-            raise ScrapeSkipError(
-                '[spectrum] saved session has expired — sign in again via '
-                'the "Sign in to Spectrum" button.')
+        if expires_at and time.time() > float(expires_at) - _TOKEN_REFRESH_BUFFER:
+            if not self._refresh_session():
+                raise ScrapeSkipError(
+                    '[spectrum] saved session has expired and could not be refreshed — '
+                    'sign in again via the "Sign in to Spectrum" button.')
+
+    def _refresh_session(self) -> bool:
+        """Silent OAuth refresh_token grant — confirmed live 2026-09-17 this
+        extends the access token's 12h life with no browser/recaptcha needed.
+        The refresh token itself has its own absolute ceiling tied to the
+        original login (refreshTokenMaxTTL, observed ~24h from login, not a
+        sliding window that resets per refresh) — once that's passed this
+        will start failing and _ensure_session falls back to asking for a
+        fresh browser sign-in."""
+        refresh_token = self.config.get('refresh_token')
+        if not refresh_token:
+            return False
+        try:
+            r = self.session.post(
+                f'{_AUTH_BASE}/auth/oauth/v2/token',
+                data={
+                    'client_id': _CLIENT_ID, 'grant_type': 'refresh_token',
+                    'refresh_token': refresh_token,
+                    'client_device_id': self.config.get('client_device_id', ''),
+                },
+                headers={
+                    'accept': 'application/json, text/plain, */*',
+                    'origin': 'https://watch.spectrum.net',
+                    'referer': 'https://watch.spectrum.net/',
+                    'user-agent': _USER_AGENT,
+                },
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('[spectrum] token refresh request failed: %s', exc)
+            return False
+        if not r.ok:
+            logger.warning('[spectrum] token refresh rejected: HTTP %d', r.status_code)
+            return False
+        try:
+            data = r.json()
+        except ValueError:
+            logger.warning('[spectrum] token refresh response was not JSON')
+            return False
+        access_token = data.get('access_token')
+        if not access_token:
+            logger.warning('[spectrum] token refresh response had no access_token: %s', data)
+            return False
+        self._update_config('access_token', access_token)
+        self._update_config('refresh_token', data.get('refresh_token') or refresh_token)
+        self._update_config('token_captured_at', int(time.time()))
+        self._update_config('token_expires_at', int(time.time()) + int(data.get('expires_in') or 0))
+        logger.info('[spectrum] refreshed access token, valid for another %ds', int(data.get('expires_in') or 0))
+        return True
 
     def _headers(self, extra: dict | None = None) -> dict:
         headers = {
