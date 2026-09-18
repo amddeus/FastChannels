@@ -24,6 +24,8 @@ _SUPPRESS_PATTERNS = (
     'tve/foxone/browser-login/input',
     'tve/google/browser-login/state',   # admin UI polls every ~250ms during the standalone Google sign-in
     'tve/google/browser-login/input',   # mousemove/click/key forwarding — up to ~16/s while dragging
+    'spectrum-browser-login/state', # admin UI polls every ~400ms during Spectrum sign-in
+    'spectrum-browser-login/input', # mousemove/click/key forwarding — up to ~16/s while dragging
     '/api/custom-channels/detect/', # stream detection status polling
     '/images/proxy',           # per-image cache hits — too noisy
     '/logos/',                 # cached logo file hits — too noisy

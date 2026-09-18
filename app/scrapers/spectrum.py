@@ -1,0 +1,527 @@
+"""
+Spectrum scraper for FastChannels.
+
+Login is entirely browser-driven (Camoufox, reCAPTCHA Enterprise + ThreatMetrix
+gated) via the "Sign in to Spectrum" button on this source's config panel —
+see app/tve/browser_login/spectrum.py. There is no scripted credential POST:
+this scraper only ever reads the access_token/refresh_token/client_device_id
+that flow already saved into config, and raises ScrapeSkipError with a clear
+pointer back to that button when there's nothing usable.
+
+DRM: DASH + Widevine/PlayReady CENC. The Widevine license server needs BOTH a
+Bearer access_token AND a second AST-Authorization header — the latter comes
+back as the x-set-ast response header on the per-channel stream/live/v6 mint
+call, not from any request/response body (confirmed live 2026-09-17).
+It's cached per-channel (stream_cache), same shape as Fubo's dash_cache,
+since it's minted per stream, not once per account.
+
+Access/refresh tokens are not renewed automatically — once the ~12h pair
+expires, calls raise ScrapeSkipError until a human signs in again via the
+browser button.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import time
+import uuid
+import random
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+from .base import (BaseScraper, ChannelData, ConfigField, ProgramData,
+                    ScrapeSkipError, StreamDeadError, infer_language_from_metadata)
+from .category_utils import category_for_channel, infer_category_from_name
+from ..tve.adobe_pass import TVENotAuthorizedError
+
+logger = logging.getLogger(__name__)
+
+_API_BASE = 'https://apis-vid.spectrum.net'
+_IMG_BASE = 'https://cdnimg.spectrum.net'
+_LICENSE_BASE = 'https://apis-drm.spectrum.net/drm/licenseServer/widevine/v2'
+_CLIENT_ID = 'stva-ovp'
+_CLIENT_VERSION = '17.32.0.289483649'
+_USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+               '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36')
+
+_MC_NAME_RE = re.compile(r'^~mc(\d+):?$')
+
+# Spectrum's own channels/v3 networkName is genuinely garbage for every Music
+# Choice channel — literally "~MC05:", nothing after the colon — confirmed
+# live 2026-09-17 by checking the raw API response directly (not a scraper
+# bug). Recovered by cross-referencing each channel's own EPG: every program
+# on a Music Choice channel IS just the channel's real name (they're 24/7
+# audio channels with no actual programming to speak of). Music Choice's
+# lineup is a stable, standardized national one (same across MVPDs), so this
+# is hardcoded rather than looked up per-scrape. #42 corrects an apparent
+# upstream typo ("Musical Choice" -> "Music Choice") for consistency with
+# every other entry.
+_MUSIC_CHOICE_NAMES: dict[int, str] = {
+    1: "Music Choice Today's Hits", 2: 'Music Choice Trending Hits',
+    3: 'Music Choice Feel-Good Favorites', 4: 'Music Choice Pop Energy',
+    5: 'Music Choice Hip Hop and R&B', 6: 'Music Choice Dance',
+    7: 'Music Choice Hip-Hop Classics', 8: 'Music Choice Throwback Jams',
+    9: 'Music Choice R&B Classics', 10: "Music Choice Today's R&B",
+    11: 'Music Choice Gospel', 12: 'Music Choice Contemporary Christian',
+    13: 'Music Choice Rock', 14: 'Music Choice Yacht Rock',
+    15: "Music Choice '60s & '70s Mellow Hits", 16: 'Music Choice Adult Alternative',
+    17: 'Music Choice Alt & Rock Favorites', 18: 'Music Choice Classic Rock',
+    19: 'Music Choice Soft Rock', 20: 'Music Choice Happy Hits',
+    21: 'Music Choice Pop Hits', 22: "Music Choice Today's Latin Hits",
+    23: 'Music Choice Tropicales', 24: 'Music Choice Romantic Latin Pop',
+    25: "Music Choice '70s & '80s Favorites", 26: "Music Choice '90s",
+    27: "Music Choice '80s", 28: "Music Choice '70s",
+    29: "Music Choice '60s Generation", 30: 'Music Choice Solid Gold Oldies',
+    31: 'Music Choice Pop & Country', 32: "Music Choice Today's Country",
+    33: 'Music Choice Country Favorites', 34: 'Music Choice Classic Country',
+    35: 'Music Choice Country Rock', 36: 'Music Choice Sleep Sounds',
+    37: 'Music Choice Relaxing Vibes', 38: 'Music Choice Calming Classical',
+    39: 'Music Choice Joyful Instrumentals', 40: 'Music Choice Pop Instrumentals',
+    41: 'Music Choice Light Classical', 42: 'Music Choice Classical Masterpieces',
+    43: 'Music Choice Soundscapes', 44: 'Music Choice Smooth Jazz',
+    45: 'Music Choice Jazz', 46: 'Music Choice Blues',
+    47: 'Music Choice Singers & Swing', 48: 'Music Choice Easy Listening',
+    49: 'Music Choice Classic Christmas', 50: 'Music Choice Sounds of the Seasons',
+}
+
+_EPG_HOURS_PER_CALL = 6
+_EPG_BLOCKS = 8  # 8 * 6h = 48h of guide data per scrape
+_STREAM_CACHE_TTL = 5 * 60  # aegisTokenRefreshSeconds was 300 on every mint seen live — match it
+
+
+class SpectrumScraper(BaseScraper):
+    source_name = 'spectrum'
+    display_name = 'Spectrum'
+    is_premium = True
+    source_category = 'premium'
+    config_required = True
+    license_url = _LICENSE_BASE
+    stream_audit_enabled = True
+    # Every channel is DASH+CENC, no exceptions observed — same shape as
+    # amazon_prime_free/nbc_tve/sling/directv/warner_tve. Declared statically
+    # rather than left to the audit's live per-fetch Widevine/PlayReady marker
+    # detection, which can false-negative on an SSAI ad-break splice landing
+    # genuinely clear content mid-otherwise-encrypted-stream (see warner_tve).
+    all_channels_require_drm_bridge = True
+    config_schema = [
+        ConfigField('username', 'Username', placeholder='your Spectrum username',
+                    help_text='Used by the "Sign in to Spectrum" button to auto-fill the sign-in form.'),
+        ConfigField('password', 'Password', field_type='password', secret=True,
+                    help_text='Used by the "Sign in to Spectrum" button to auto-fill the sign-in form.'),
+    ]
+
+    def __init__(self, config: dict | None = None):
+        super().__init__(config)
+        self._stream_cache: dict = dict(self.cache.get('stream_cache') or {})
+
+    # ── Auth ─────────────────────────────────────────────────────────────────
+
+    def _ensure_session(self) -> None:
+        if not self.config.get('access_token') or not self.config.get('client_device_id'):
+            raise ScrapeSkipError(
+                '[spectrum] no session — use the source\'s "Sign in to Spectrum" '
+                'button (Camoufox, reCAPTCHA-gated) to authenticate.')
+        expires_at = self.config.get('token_expires_at')
+        if expires_at and time.time() > float(expires_at):
+            raise ScrapeSkipError(
+                '[spectrum] saved session has expired — sign in again via '
+                'the "Sign in to Spectrum" button.')
+
+    def _headers(self, extra: dict | None = None) -> dict:
+        headers = {
+            'accept': 'application/json, text/plain, */*',
+            'authorization': f"Bearer {self.config.get('access_token', '')}",
+            'device_id': self.config.get('client_device_id', ''),
+            'x-client-id': _CLIENT_ID,
+            'x-client-version': _CLIENT_VERSION,
+            'origin': 'https://watch.spectrum.net',
+            'referer': 'https://watch.spectrum.net/',
+            'user-agent': _USER_AGENT,
+        }
+        if extra:
+            headers.update(extra)
+        return headers
+
+    @staticmethod
+    def _raise_for_auth(r) -> None:
+        """Spectrum's API gateway returns a plain 400 (not 401/403) for an
+        expired/invalid token — {"resultCode":"2076","resultMessage":"Bad
+        Request"} — confirmed live 2026-09-17. Surface that as a clear
+        "sign in again" skip rather than a raw HTTPError traceback; anything
+        else still raises normally."""
+        if r.status_code in (400, 401, 403):
+            raise ScrapeSkipError(
+                f'[spectrum] API rejected the saved session (HTTP {r.status_code}) — '
+                'sign in again via the "Sign in to Spectrum" button.')
+        r.raise_for_status()
+
+    # ── Channels ─────────────────────────────────────────────────────────────
+
+    def fetch_channels(self) -> list[ChannelData]:
+        self._ensure_session()
+        r = self.session.get(
+            f'{_API_BASE}/lantern/lrs/api/smarttv/channels/v3',
+            params={'streamVersion': 5}, headers=self._headers(), timeout=30,
+        )
+        self._raise_for_auth(r)
+        rows = r.json()
+
+        channels: list[ChannelData] = []
+        for row in rows:
+            # Excludes VOD/non-linear catalog rows (e.g. "Video On Demand") —
+            # every real tunable channel in a live sample had online=true.
+            if not row.get('online'):
+                continue
+            entitlement_id = row.get('entitlementId')
+            tms_guide_id = row.get('tmsGuideId')
+            # ~6% of raw names carry stray leading/trailing whitespace straight
+            # from Spectrum (e.g. " MeTV (KMEE) HD", "CW (KAZT) ") — confirmed
+            # live 2026-09-17 across 30/502 channels.
+            name = (row.get('networkName') or row.get('callSign') or '').strip()
+            mc_match = _MC_NAME_RE.match(name.lower())
+            if mc_match:
+                name = _MUSIC_CHOICE_NAMES.get(int(mc_match.group(1)), name)
+            if not entitlement_id or not tms_guide_id or not name:
+                continue
+            numbers = row.get('channelNumbers') or []
+            logo_uri = row.get('logoUri')
+            # ~8% of channels carry more than one raw genre (e.g. AMC HD West:
+            # ['Entertainment', 'Movies']) — try each individually in order
+            # rather than joining them, which would never match any alias.
+            category = None
+            for raw_genre in (row.get('genres') or [None]):
+                category = category_for_channel(name, raw_genre, source_name='spectrum')
+                if category:
+                    break
+            category = category or infer_category_from_name(name)
+            channels.append(ChannelData(
+                source_channel_id=str(entitlement_id),
+                name=name,
+                stream_url=f'spectrum://{entitlement_id}',
+                logo_url=f'{_IMG_BASE}{logo_uri}' if logo_uri else None,
+                category=category,
+                language=infer_language_from_metadata(name),
+                country='US',
+                stream_type='dash',
+                number=numbers[0] if numbers else None,
+                # tmsGuideId, not entitlementId — the EPG grid endpoint is keyed
+                # by this, not by the playback/entitlement id. Read back in
+                # fetch_epg() via each ChannelData's own .guide_key.
+                guide_key=tms_guide_id,
+            ))
+        logger.info('[spectrum] %d channels fetched', len(channels))
+        return channels
+
+    # ── EPG ──────────────────────────────────────────────────────────────────
+
+    def fetch_epg(self, channels: list[ChannelData], **kwargs) -> list[ProgramData]:
+        self._ensure_session()
+        tms_to_entitlement = {ch.guide_key: ch.source_channel_id for ch in channels if ch.guide_key}
+        if not tms_to_entitlement:
+            return []
+        tms_ids = ','.join(tms_to_entitlement.keys())
+
+        now = datetime.now(timezone.utc)
+        block_start = now.replace(minute=0, second=0, microsecond=0)
+        # One block before "now" too, matching what the real app fetches —
+        # covers the currently-airing program even when "now" isn't exactly
+        # on an hour boundary.
+        block_start -= timedelta(hours=block_start.hour % _EPG_HOURS_PER_CALL)
+
+        programs: list[ProgramData] = []
+        for i in range(_EPG_BLOCKS):
+            start = block_start + timedelta(hours=_EPG_HOURS_PER_CALL * i)
+            r = self.session.get(
+                f'https://stva-epgs-cf-v4.ipvideo.prd.spectrum.net/epgs/api/smarttv/guide/v4/twctv/grid',
+                params={
+                    'hours': _EPG_HOURS_PER_CALL,
+                    'startDateTime': int(start.timestamp()),
+                    'tmsIds': tms_ids,
+                },
+                headers=self._headers(), timeout=60,
+            )
+            if i == 0:
+                self._raise_for_auth(r)  # bail out fast — every block will fail the same way
+            elif not r.ok:
+                logger.warning('[spectrum] EPG block %d (start=%s) failed: HTTP %d', i, start.isoformat(), r.status_code)
+                continue
+            grid = r.json()
+            for tms_id, entries in grid.items():
+                entitlement_id = tms_to_entitlement.get(tms_id)
+                if not entitlement_id:
+                    continue
+                for entry in entries or []:
+                    program = self._program_from_entry(entitlement_id, entry)
+                    if program:
+                        programs.append(program)
+        logger.info('[spectrum] %d EPG entries fetched across %d blocks', len(programs), _EPG_BLOCKS)
+        return programs
+
+    @staticmethod
+    def _program_from_entry(entitlement_id: str, entry: dict) -> ProgramData | None:
+        start_sec = entry.get('startTimeSec')
+        duration_min = entry.get('durationMinutes')
+        title = entry.get('title')
+        if start_sec is None or duration_min is None or not title:
+            return None
+        start_time = datetime.fromtimestamp(start_sec, tz=timezone.utc)
+        end_time = start_time + timedelta(minutes=duration_min)
+        metadata = entry.get('metadata') or {}
+        genres = entry.get('genres') or []
+        is_movie = 'movie' in (g.lower() for g in genres) or (entry.get('programType') or '').lower() == 'movie'
+        program_type = 'movie' if is_movie else ('episode' if metadata.get('type') == 'episode' else None)
+        image_uri = entry.get('imageUrl')
+        return ProgramData(
+            source_channel_id=entitlement_id,
+            title=title,
+            start_time=start_time,
+            end_time=end_time,
+            description=entry.get('shortDesc') or None,
+            poster_url=f'{_IMG_BASE}{image_uri}' if image_uri else None,
+            category='; '.join(genres) or None,
+            rating=entry.get('rating') or None,
+            episode_title=metadata.get('title') if metadata.get('type') == 'episode' else None,
+            season=metadata.get('season'),
+            episode=metadata.get('episode'),
+            program_type=program_type,
+            series_id=metadata.get('tmsSeriesId') or entry.get('vodTmsSeriesId') or None,
+            episode_id=entry.get('tmsProgramId') or None,
+        )
+
+    # ── Playback ─────────────────────────────────────────────────────────────
+
+    def resolve(self, raw_url: str) -> str:
+        self._ensure_session()
+        cid = raw_url.removeprefix('spectrum://')
+        cached = self._cached_stream(cid)
+        if cached:
+            return cached['manifest_url']
+        manifest_url, ast, stream_session_id, _aegis_token = self._mint_stream(cid)
+        self._cache_stream(cid, manifest_url, ast, stream_session_id)
+        return manifest_url
+
+    def audit_resolve(self, raw_url: str) -> str:
+        """Stream Audit checks all ~500 channels back-to-back, one right after
+        another — unlike real playback, which holds one session open for as
+        long as someone's actually watching. Spectrum caps concurrent stream
+        sessions at 3 per account ("AegisTooManySessions", confirmed live
+        2026-09-17: every mint that doesn't release its predecessor eats one
+        of only 3 slots, so the 4th+ channel in an audit run starts failing
+        with 429 and the whole audit aborts around ~20 consecutive errors).
+        Release the session immediately after minting since the audit only
+        needs the manifest once — this is audit-only (see run_stream_audit's
+        audit_resolve preference) so normal resolve()/play() never releases a
+        session a real, possibly-concurrent viewer might still be using."""
+        self._ensure_session()
+        cid = raw_url.removeprefix('spectrum://')
+        manifest_url, ast, stream_session_id, aegis_token = self._mint_stream(cid)
+        self._cache_stream(cid, manifest_url, ast, stream_session_id)
+        if aegis_token:
+            self._release_aegis(aegis_token)
+        return manifest_url
+
+    def _release_aegis(self, aegis_token: str) -> None:
+        try:
+            self.session.delete(
+                f'{_API_BASE}/ipvs/api/smarttv/aegis/v1',
+                params={'aegis': aegis_token},
+                headers=self._headers(), timeout=10,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug('[spectrum] aegis release failed (non-fatal): %s', exc)
+
+    def _cached_stream(self, cid: str) -> dict | None:
+        entry = self._stream_cache.get(cid)
+        if not entry or not entry.get('manifest_url'):
+            return None
+        if (time.time() - float(entry.get('cached_at', 0))) >= _STREAM_CACHE_TTL:
+            self._stream_cache.pop(cid, None)
+            self._update_cache('stream_cache', self._stream_cache)
+            return None
+        return entry
+
+    def _cache_stream(self, cid: str, manifest_url: str, ast: str | None, stream_session_id: str) -> None:
+        self._stream_cache[cid] = {
+            'manifest_url': manifest_url,
+            'ast': ast,
+            'stream_session_id': stream_session_id,
+            'cached_at': time.time(),
+        }
+        self._update_cache('stream_cache', self._stream_cache)
+
+    def _mint_stream(self, cid: str) -> tuple[str, str | None, str, str | None]:
+        device_id = self.config.get('client_device_id', '')
+        r = self.session.post(
+            f'{_API_BASE}/lantern/foc-ipvs/api/smarttv/stream/live/v6/{cid}',
+            params={
+                'csid': 'stva_ovp_pc_live', 'dai-supported': 'true', 'drm-supported': 'true',
+                'vast-supported': 'true', 'adID': device_id, 'secureTransport': 'true',
+                'use_token': 'true', 'OTT': 'false', 'parentalControlsEnabled': 'false',
+            },
+            json={'deviceCapabilities': {
+                'packaging': 'dash', 'drm': 'cenc',
+                'videoCodecs': ['avc'], 'audioCodecs': ['aac', 'ac3', 'eac3'],
+            }},
+            headers=self._headers({'content-type': 'application/json'}), timeout=20,
+        )
+        if r.status_code == 403:
+            # A 403 here isn't necessarily a dead session — Spectrum overloads it
+            # for at least two distinct per-channel reasons, both confirmed live
+            # 2026-09-17, neither of which "sign in again" fixes:
+            #   {"context":{"unentitled":true,...}}  — account package doesn't
+            #     include this channel. Permanent account-tier fact → StreamDeadError,
+            #     same handling play.py already gives Philo's "channel not in
+            #     subscription" case.
+            #   {"context":{"blockedOOH":true,"dmaMismatch":...,"initLocation":
+            #     {"inMarket":false,...}},...}  — local-affiliate retransmission
+            #     rules blocking this SPECIFIC channel because the resolving IP
+            #     isn't recognized as in-market. Not an account-tier fact the way
+            #     "unentitled" is (a real subscriber's own home connection would
+            #     likely show inMarket:true for their own locals — this could
+            #     resolve differently on a different network), but the channel is
+            #     just as unplayable from THIS deployment right now, so it's
+            #     disabled the same way — TVENotAuthorizedError rather than
+            #     StreamDeadError so the admin UI can tell "not authorized from
+            #     here" apart from "stream is actually broken". A future Stream
+            #     Audit re-checks NotAuthorized channels automatically and
+            #     re-enables this the moment it stops happening (e.g. the server
+            #     moves to the account's real home network) — confirmed live
+            #     2026-09-17 this doesn't self-resolve by waiting, only by
+            #     resolving from a different network.
+            try:
+                context = r.json().get('context') or {}
+            except ValueError:
+                context = {}
+            if context.get('unentitled') or context.get('blockedByPCChannel') or context.get('blockedDRM'):
+                reason = next((k for k, v in context.items() if k.startswith(('unentitled', 'blocked')) and v), 'blocked')
+                raise StreamDeadError(f'[spectrum] channel {cid} not entitled under this account ({reason})')
+            if context:
+                blocked_reason = next(
+                    (k for k, v in context.items() if v is True and k not in ('inUS', 'inUsOrTerritory')), None,
+                )
+                if blocked_reason or context.get('dmaMismatch') or context.get('streamProperties', {}).get('availableOutOfMarket') is False:
+                    raise TVENotAuthorizedError(
+                        f'[spectrum] channel {cid} blocked for this location/market '
+                        f'({blocked_reason or "dmaMismatch"}) — not a session problem, '
+                        'may resolve differently from the account\'s actual home network.')
+        if r.status_code == 429:
+            # Not generic rate-limiting — Spectrum caps concurrent stream sessions
+            # at 3 per account ("AegisTooManySessions"/networkLimits.sessionLimit,
+            # confirmed live 2026-09-17). Only actually fixable by releasing
+            # sessions promptly (see audit_resolve/_release_aegis); reported here
+            # as an accurate skip rather than a generic error so it doesn't count
+            # toward the audit's consecutive-error abort budget.
+            try:
+                failure = r.json().get('failure')
+            except ValueError:
+                failure = None
+            if failure == 'AegisTooManySessions':
+                raise ScrapeSkipError(
+                    f'[spectrum] channel {cid}: account at its concurrent stream session '
+                    'limit — not a dead session, sessions should free up shortly.')
+        self._raise_for_auth(r)
+        data = r.json()
+        ast = r.headers.get('x-set-ast')
+        aegis_token = (data.get('aegis') or {}).get('aegisToken')
+        stream_url = data.get('streamUrl')
+        if not stream_url:
+            raise RuntimeError(f'[spectrum] stream/live/v6 returned no streamUrl for {cid}: {data}')
+
+        stream_session_id = (
+            time.strftime('%Y%m%d%H%M') + 'V-' + str(uuid.uuid4()) + '|'
+            + format(int(time.time() * 1000), 'x') + '|0'
+        )
+        manifest_url = stream_url
+        if urllib.parse.urlsplit(stream_url).netloc == 'edge-mm.spectrum.net':
+            # DAI-eligible channels route through this ad-decisioning redirector,
+            # which needs Nielsen/ad-tracking query params appended or it 404s
+            # ("UNKNOWN-ID") — confirmed live these are self-generated, not
+            # signed/validated.
+            init_location = data.get('initLocation') or {}
+            base, _, qs = stream_url.partition('?')
+            params = dict(urllib.parse.parse_qsl(qs))
+            params.update({
+                'lat': '0', 'vcid': str(uuid.uuid4()), 'mapTEnabled': 'false',
+                'blockDataSharing': 'false',
+                'bz5': init_location.get('geoZip', ''), 'z5': init_location.get('serviceZip', ''),
+                'pvrn': str(random.randint(10 ** 19, 10 ** 20 - 1)),
+                'vprn': str(random.randint(10 ** 19, 10 ** 20 - 1)),
+                'adId': device_id, 'csid': 'stva_ovp_pc_live',
+                'altContent': data.get('altContent', ''),
+                'behindOwnModem': 'false', 'stateAbbr': init_location.get('stateAbbr', ''),
+                'inMarket': 'false', 'OTT': 'false', 'parentalControlsEnabled': 'false',
+                'streamSessionId': stream_session_id,
+            })
+            manifest_url = base + '?' + urllib.parse.urlencode(params)
+        return manifest_url, ast, stream_session_id, aegis_token
+
+    @classmethod
+    def get_license_url(cls, config: dict, channel_id: str | None = None) -> str | None:
+        if not channel_id:
+            return _LICENSE_BASE
+        entry = (config.get('stream_cache') or {}).get(channel_id)
+        session_id = entry.get('stream_session_id') if isinstance(entry, dict) else None
+        if not session_id:
+            return _LICENSE_BASE
+        return f'{_LICENSE_BASE}?contentType=LINEAR&streamSessionId={session_id}'
+
+    @classmethod
+    def prepare_license_request(
+        cls, challenge: bytes, config: dict, channel_id: str | None = None, **kwargs
+    ) -> tuple[bytes, dict]:
+        headers = {
+            'Origin': 'https://watch.spectrum.net',
+            'Referer': 'https://watch.spectrum.net/',
+        }
+        token = config.get('access_token')
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        # Returned as the x-set-ast response header on stream/live/v6, per
+        # channel — required in addition to the Bearer token or the license
+        # server 400s with AST_AUTHORIZATION_HEADER_REQUIRED (confirmed live
+        # 2026-09-17). Cached alongside the manifest URL, not source-wide.
+        entry = (config.get('stream_cache') or {}).get(channel_id or '')
+        ast = entry.get('ast') if isinstance(entry, dict) else None
+        if ast:
+            headers['AST-Authorization'] = ast
+        return challenge, headers
+
+
+def save_login_result(local_storage: dict, cox_cookies: list[dict] | None) -> None:
+    """Persists tokens harvested by app.tve.browser_login.spectrum.run_spectrum_signin
+    onto the spectrum Source row. local_storage is the raw {oauth_token,
+    xoauth_refresh_token, device_id, xoauth_device_verifier, xoauth_username,
+    xoauth_token_expiration} dict read directly out of the signed-in page's
+    localStorage — these are the SAME keys the real watch.spectrum.net app reads
+    on every load, so this works whether sign-in just happened in this session
+    or silently carried over via the persistent Camoufox profile's cookies.
+    cox_cookies is cached purely so a future Cox TVE integration (this account
+    authenticates against Cox's own Okta org — see project_spectrum_scraper_
+    research memory) can reuse this same session without a second interactive
+    login; nothing reads it yet."""
+    import time as _time
+    from ..extensions import db
+    from ..models import Source
+
+    src = Source.query.filter_by(name='spectrum').first()
+    if not src:
+        src = Source(name='spectrum', display_name='Spectrum', is_enabled=False)
+        db.session.add(src)
+    cfg = dict(src.config or {})
+    cfg['access_token'] = local_storage.get('oauth_token')
+    cfg['refresh_token'] = local_storage.get('xoauth_refresh_token')
+    cfg['device_verifier'] = local_storage.get('xoauth_device_verifier')
+    cfg['token_captured_at'] = int(_time.time())
+    expiration_ms = local_storage.get('xoauth_token_expiration')
+    if expiration_ms:
+        try:
+            cfg['token_expires_at'] = int(expiration_ms) // 1000
+        except (TypeError, ValueError):
+            pass
+    if local_storage.get('device_id'):
+        cfg['client_device_id'] = local_storage['device_id']
+    if cox_cookies:
+        cfg['cox_cookie_jar'] = cox_cookies
+        cfg['cox_cookie_jar_captured_at'] = int(_time.time())
+    src.config = cfg
+    db.session.commit()

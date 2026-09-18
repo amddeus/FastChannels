@@ -1694,6 +1694,60 @@ def roku_dash_proxy(channel_id: str):
     return redirect(mpd_url, code=302)
 
 
+@play_bp.route('/play/spectrum/<channel_id>/dash.mpd')
+def spectrum_dash_proxy(channel_id: str):
+    """DASH (Widevine) manifest redirect for a Spectrum channel.
+
+    Every Spectrum channel is DASH+CENC — there's no separate HLS variant to fall
+    back to, unlike Roku/Fubo above. This dedicated .../dash.mpd route (rather than
+    the generic /play/spectrum/<id>.m3u8) exists purely so fc_player/ExoPlayer infers
+    the DASH extractor from the URL extension instead of the HLS one — confirmed live
+    2026-09-17 that the generic .m3u8-suffixed proxy URL made ExoPlayer try to parse
+    the (correctly DASH) response as an HLS playlist and fail with "Input does not
+    start with the #EXTM3U header". Spectrum's CDN sends no CORS header of its own,
+    but a 302 is fine here since only native players (fc_player/PrismCast) use this
+    route, never the browser watch page — no body proxy/rewrite needed.
+    """
+    from urllib.parse import unquote as _unquote
+
+    raw_id = _unquote(channel_id)
+    channel = (
+        Channel.query
+        .join(Source)
+        .filter(Source.name == 'spectrum', Channel.source_channel_id == raw_id)
+        .first()
+    )
+    if not channel:
+        abort(404)
+
+    scraper_cls = registry.get('spectrum')
+    if not scraper_cls:
+        return _unavailable_response()
+    scraper = scraper_cls(config=channel.source.config or {})
+    try:
+        mpd_url = scraper.resolve(channel.stream_url)
+    except Exception as e:
+        logger.warning('[spectrum-dash] resolve failed for %s: %s', raw_id[:40], e)
+        return _unavailable_response()
+    finally:
+        if getattr(scraper, '_pending_cache_updates', None):
+            try:
+                persist_source_cache_updates(channel.source_id, scraper._pending_cache_updates)
+            except Exception:
+                pass
+        if scraper._pending_config_updates:
+            try:
+                persist_source_config_updates(channel.source_id, scraper._pending_config_updates)
+            except Exception:
+                pass
+
+    if not mpd_url or not mpd_url.startswith('http'):
+        logger.warning('[spectrum-dash] no DASH URL for %s', raw_id[:40])
+        return _unavailable_response()
+
+    return redirect(mpd_url, code=302)
+
+
 _FUBO_MPD_SEG_ATTR_RE = re.compile(r'(initialization|media)="([^"]+)"')
 
 

@@ -835,6 +835,39 @@ def stop_google_signin() -> None:
     _force_kill_mvpd_browser()
 
 
+def trigger_spectrum_signin() -> bool:
+    """Standalone Spectrum sign-in — see app.tve.browser_login.spectrum.run_spectrum_signin's
+    docstring. Returns True if a job was enqueued, False if one is already running."""
+    try:
+        q = get_fast_queue()
+        job_id = 'spectrum-signin'
+        if _mvpd_tve_profile_busy(q):
+            logger.debug('MVPD browser login already running')  # see trigger_mvpd_browser_login
+            return False
+        q.enqueue('app.tve.browser_login.spectrum.run_spectrum_signin', job_timeout=630, job_id=job_id)
+        logger.info('Enqueued Spectrum sign-in')
+        return True
+    except Exception as e:
+        logger.warning(f'RQ unavailable ({e}), falling back to thread for Spectrum sign-in')
+        import threading
+        from app.tve.browser_login.spectrum import run_spectrum_signin
+        thread_name = 'spectrum-signin-fallback'
+        if _mvpd_tve_profile_busy_fallback():
+            logger.info('MVPD browser login fallback thread already running')
+            return False
+        threading.Thread(target=run_spectrum_signin, daemon=True, name=thread_name).start()
+        return True
+
+
+def stop_spectrum_signin() -> None:
+    try:
+        r = redis.from_url(current_app.config['REDIS_URL'])
+        r.setex('spectrum:browser-login:stop', 30, '1')
+    except Exception as e:
+        logger.warning(f'Failed to signal Spectrum sign-in stop: {e}')
+    _force_kill_mvpd_browser()
+
+
 def trigger_tvtv_cache_refresh() -> str:
     """Returns 'queued', 'deferred' (scraper work active), or 'active'
     (refresh already queued/running)."""
