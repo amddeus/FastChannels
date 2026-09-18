@@ -49,8 +49,7 @@ def list_sources():
     # defer(Source.config): this endpoint is polled on every UI cycle and to_dict()
     # never reads config, but config is effectively a cache blob (Roku's is ~1.2MB).
     # Loading it on every poll re-parses ~1.2MB of JSON for nothing and feeds
-    # allocator fragmentation on the long-lived workers. See project memory:
-    # Source.config join hazard.
+    # allocator fragmentation on the long-lived workers.
     return jsonify([
         s.to_dict()
         for s in Source.query.options(defer(Source.config)).order_by(Source.display_name).all()

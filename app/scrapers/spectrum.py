@@ -19,9 +19,13 @@ The ~12h access token is refreshed silently via the OAuth refresh_token grant
 (_refresh_session, confirmed live 2026-09-17) whenever it's within
 _TOKEN_REFRESH_BUFFER of expiring — no browser/recaptcha needed for that. The
 refresh_token itself has its own absolute ceiling tied to the original login
-(observed ~24h, not a sliding window that resets per refresh); once that's
-passed, refresh attempts fail and ScrapeSkipError points back to the browser
-button for a fresh sign-in.
+(refresh_ceiling_at, read from validateSession's refreshTokenMaxTTL — a
+countdown, not a sliding window that resets per refresh); once that's within
+_RELOGIN_BUFFER, app.worker's spectrum_relogin_watchdog job fires an
+unattended Camoufox re-login (check_relogin_due) using saved credentials
+against the same trusted persistent profile the manual button uses. Only if
+that can't complete on its own — e.g. credentials changed — does a scrape
+ever fall back to ScrapeSkipError pointing a human back to the button.
 """
 from __future__ import annotations
 
@@ -32,6 +36,8 @@ import uuid
 import random
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+
+import requests
 
 from .base import (BaseScraper, ChannelData, ConfigField, ProgramData,
                     ScrapeSkipError, StreamDeadError, infer_language_from_metadata)
@@ -49,6 +55,8 @@ _CLIENT_VERSION = '17.32.0.289483649'
 _USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36')
 _TOKEN_REFRESH_BUFFER = 10 * 60  # refresh 10min before actual expiry, not exactly at it
+_RELOGIN_BUFFER = 3 * 60 * 60    # trigger an unattended re-login with 3h of runway left on the refresh_token's ceiling
+_RELOGIN_COOLDOWN = 45 * 60      # don't re-trigger more than once per 45min if a prior attempt is still in flight or failed
 
 _MC_NAME_RE = re.compile(r'^~mc(\d+):?$')
 
@@ -181,6 +189,49 @@ class SpectrumScraper(BaseScraper):
         self._update_config('token_captured_at', int(time.time()))
         self._update_config('token_expires_at', int(time.time()) + int(data.get('expires_in') or 0))
         logger.info('[spectrum] refreshed access token, valid for another %ds', int(data.get('expires_in') or 0))
+        ceiling_ttl = _fetch_refresh_ceiling(
+            self.config.get('access_token'), self.config.get('refresh_token'),
+            self.config.get('client_device_id'))
+        if ceiling_ttl is not None:
+            self._update_config('refresh_ceiling_at', int(time.time()) + ceiling_ttl)
+        return True
+
+    def check_relogin_due(self) -> bool:
+        """Called on a timer by app.worker's spectrum_relogin_watchdog job, NOT
+        from any normal scrape/resolve path. _refresh_session can extend the
+        access token indefinitely but only up to the refresh_token's own
+        absolute ceiling (refresh_ceiling_at) — this decides whether that
+        ceiling is close enough to warrant firing an unattended re-login
+        through the same Camoufox flow the "Sign in to Spectrum" button uses,
+        and kicks it off async via trigger_spectrum_signin (never drives a
+        browser itself — that's Camoufox-only and doesn't belong on this
+        class). Device trust built up in the persistent mvpd_tve profile is
+        what let the original human-driven login past Spectrum's reCAPTCHA
+        Enterprise + ThreatMetrix gate (a genuinely fresh profile was
+        rejected outright), so an unattended run against that same profile is
+        expected to usually complete without a human. If it can't — changed
+        credentials, a new verification step — it simply times out like the
+        manual button would, and the next tick retries on cooldown until a
+        human intervenes; ScrapeSkipError's pointer back to the button
+        remains the ultimate fallback everywhere else in this scraper."""
+        username = (self.config.get('username') or '').strip()
+        password = (self.config.get('password') or '').strip()
+        if not username or not password:
+            return False
+        ceiling_at = self.config.get('refresh_ceiling_at')
+        if not ceiling_at:
+            return False
+        remaining = float(ceiling_at) - time.time()
+        if remaining > _RELOGIN_BUFFER:
+            return False
+        last_attempt = float(self.config.get('auto_relogin_last_attempt_at') or 0)
+        if time.time() - last_attempt < _RELOGIN_COOLDOWN:
+            return False
+        from ..routes.tasks import trigger_spectrum_signin
+        if not trigger_spectrum_signin():
+            return False  # shared browser profile busy with another MVPD login — retry next tick
+        self._update_config('auto_relogin_last_attempt_at', int(time.time()))
+        logger.info('[spectrum] refresh_token has %.1fh left before its ceiling — triggered unattended re-login', remaining / 3600)
         return True
 
     def _headers(self, extra: dict | None = None) -> dict:
@@ -543,6 +594,38 @@ class SpectrumScraper(BaseScraper):
         return challenge, headers
 
 
+def _fetch_refresh_ceiling(access_token: str, refresh_token: str, client_device_id: str) -> int | None:
+    """validateSession is the only endpoint that reports refreshTokenMaxTTL —
+    seconds actually remaining on the refresh_token's absolute ceiling, tied to
+    the original login and confirmed live 2026-09-17 NOT to reset when the
+    access token is refreshed (86373s at login, 58018s remaining after one
+    refresh roughly 8h later — a countdown, not a sliding window). Callers
+    persist now()+this as refresh_ceiling_at so the auto-relogin watchdog knows
+    the real deadline instead of guessing ~24h. Best-effort: returns None on
+    any failure, never raises — this is bookkeeping, not something worth
+    failing a login or a refresh over."""
+    try:
+        r = requests.get(
+            f'{_AUTH_BASE}/auth/oauth/v2/validateSession',
+            params={'getLocation': 'false'},
+            headers={
+                'x-access-token': access_token or '',
+                'x-refresh-token': refresh_token or '',
+                'x-client-device-id': client_device_id or '',
+                'x-client-id': _CLIENT_ID,
+                'user-agent': _USER_AGENT,
+            },
+            timeout=15,
+        )
+        if not r.ok:
+            return None
+        ttl = r.json().get('refreshTokenMaxTTL')
+        return int(ttl) if ttl is not None else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug('[spectrum] refreshTokenMaxTTL lookup failed: %s', exc)
+        return None
+
+
 def save_login_result(local_storage: dict, cox_cookies: list[dict] | None) -> None:
     """Persists tokens harvested by app.tve.browser_login.spectrum.run_spectrum_signin
     onto the spectrum Source row. local_storage is the raw {oauth_token,
@@ -552,9 +635,8 @@ def save_login_result(local_storage: dict, cox_cookies: list[dict] | None) -> No
     on every load, so this works whether sign-in just happened in this session
     or silently carried over via the persistent Camoufox profile's cookies.
     cox_cookies is cached purely so a future Cox TVE integration (this account
-    authenticates against Cox's own Okta org — see project_spectrum_scraper_
-    research memory) can reuse this same session without a second interactive
-    login; nothing reads it yet."""
+    authenticates against Cox's own Okta org) can reuse this same session
+    without a second interactive login; nothing reads it yet."""
     import time as _time
     from ..extensions import db
     from ..models import Source
@@ -576,6 +658,14 @@ def save_login_result(local_storage: dict, cox_cookies: list[dict] | None) -> No
             pass
     if local_storage.get('device_id'):
         cfg['client_device_id'] = local_storage['device_id']
+    ceiling_ttl = _fetch_refresh_ceiling(
+        cfg.get('access_token'), cfg.get('refresh_token'), cfg.get('client_device_id'))
+    if ceiling_ttl is not None:
+        cfg['refresh_ceiling_at'] = int(_time.time()) + ceiling_ttl
+    # A fresh login means the auto-relogin watchdog's job is done — clear any
+    # retry bookkeeping from a prior attempt so it doesn't carry over.
+    cfg.pop('auto_relogin_last_attempt_at', None)
+    cfg.pop('auto_relogin_last_error', None)
     if cox_cookies:
         cfg['cox_cookie_jar'] = cox_cookies
         cfg['cox_cookie_jar_captured_at'] = int(_time.time())

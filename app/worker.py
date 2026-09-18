@@ -3754,6 +3754,32 @@ if __name__ == '__main__':
                           id='directv_token_watchdog', max_instances=1, coalesce=True,
                           misfire_grace_time=300)
 
+        def _scheduled_spectrum_relogin_watchdog():
+            # Unlike DirecTV's token watchdog above, this doesn't refresh anything
+            # itself — SpectrumScraper.check_relogin_due() just decides whether the
+            # refresh_token's absolute ceiling (refresh_ceiling_at) is close enough
+            # to warrant firing the same Camoufox login flow the "Sign in to
+            # Spectrum" button uses (async, via trigger_spectrum_signin), and this
+            # persists the cooldown marker check_relogin_due sets on trigger. A
+            # 20min interval against a 3h buffer and 45min cooldown leaves room
+            # for several unattended retries before the ceiling actually hits.
+            from app.scrapers.spectrum import SpectrumScraper
+            try:
+                with flask_app.app_context():
+                    source = Source.query.filter_by(name='spectrum', is_enabled=True).first()
+                    if not source:
+                        return
+                    scraper = SpectrumScraper(config=source.config or {})
+                    scraper.check_relogin_due()
+                    if scraper._pending_config_updates:
+                        persist_source_config_updates(source.id, scraper._pending_config_updates)
+            except Exception as e:
+                logger.warning('[spectrum] relogin watchdog check failed: %s', e)
+
+        scheduler.add_job(_scheduled_spectrum_relogin_watchdog, 'interval', minutes=20,
+                          id='spectrum_relogin_watchdog', max_instances=1, coalesce=True,
+                          misfire_grace_time=600)
+
         def _scheduled_fc_player_idle_watchdog():
             from app import fc_player_bridge
             try:

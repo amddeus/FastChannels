@@ -211,9 +211,8 @@ def run_spectrum_signin():
                 # chance to verify; if it's there but invalid, force a real fresh
                 # login instead of sitting forever waiting for a login form that
                 # SSO carryover means will never appear. Scoped to ONLY Spectrum/
-                # Cox cookies — never the whole shared profile (see
-                # project_spectrum_scraper_research memory for why that matters:
-                # clearing the whole context once wiped every other MVPD's cookies).
+                # Cox cookies — never the whole shared profile: clearing the whole
+                # context once wiped every other MVPD's cookies.
                 page.wait_for_timeout(1500)
                 if not _try_capture(page) and _rejected:
                     set_status('running', 'Saved session looks stale — starting a fresh sign-in…', page.url)

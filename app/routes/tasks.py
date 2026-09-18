@@ -513,10 +513,11 @@ def stop_sling_browser_login():
 # waits (up to job_timeout) for the first to release the shared profile.
 _MVPD_TVE_PROFILE_JOB_IDS = (
     'mvpd-browser-login', 'nbc-mvpd-browser-login', 'fox-mvpd-browser-login', 'google-signin',
+    'spectrum-signin',
 )
 _MVPD_TVE_PROFILE_THREAD_NAMES = (
     'mvpd-browser-login-fallback', 'nbc-mvpd-browser-login-fallback', 'fox-mvpd-browser-login-fallback',
-    'google-signin-fallback',
+    'google-signin-fallback', 'spectrum-signin-fallback',
 )
 
 
