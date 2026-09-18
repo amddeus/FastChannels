@@ -192,7 +192,7 @@ def run_spectrum_signin():
         try:
             with Camoufox(
                 headless='virtual', os='windows', persistent_context=True,
-                user_data_dir=profile_dir, window=(1280, 800),
+                user_data_dir=profile_dir, window=(1280, 800), block_images=True,
             ) as context:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.on('crash', lambda p: logger.warning('[spectrum-signin] page CRASH event fired (url was %s)', _safe_page_url(p)))
