@@ -615,6 +615,7 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
 
     def _adobe_session_redirect(
         self, channel: AMCNChannel, software_statement: str, device_id: str, mso_id: str,
+        allow_empty_redirect: bool = False,
     ) -> tuple[AdobePassCoxClient, str, str, dict[str, str], requests.Response]:
         """Registers an Adobe Pass v2 client and starts a session for `mso_id`.
 
@@ -625,6 +626,16 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
         redirect it's just the raw 3xx response (unused), but DIRECTV's own
         backend needs its body directly since DIRECTV never redirects here
         at all (see app/tve/mvpd/directv.py's directv_login() docstring).
+
+        allow_empty_redirect=True suppresses the raise below for a 200 with
+        no real redirect (Spectrum's shape — confirmed live 2026-09-18, an
+        auto-submit SAML form rather than a 3xx) instead of only DTV, and
+        just returns mso_login_url='' — only safe for a caller that can act
+        on page_response itself, i.e. app.tve.browser_login.amcn's
+        browser-assisted loop navigating a real browser straight to
+        page_response.url so its onload JS submits the form natively. The
+        scripted (non-browser) callers below never pass this — they have no
+        browser to hand an unfollowed form to.
         """
         client = AdobePassCoxClient(
             requestor_id=channel.requestor_id,
@@ -682,20 +693,7 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
             # r.url — same exemption fox_tve.py's equivalent call makes.
             r.raise_for_status()
             mso_login_url = ''
-        if not mso_login_url and mso_id != 'DTV':
-            # Confirmed live 2026-09-18: Spectrum hits this same "no real
-            # redirect" shape DTV is already exempted for — a 200 with an
-            # auto-submit SAML form (onload="document.forms[0].submit()")
-            # instead of a 3xx. Unlike DTV, nothing downstream here drives
-            # that form — AMCN's browser-assisted loop
-            # (app/tve/browser_login/amcn.py) unconditionally does
-            # page.goto(mso_login_url, ...), which needs a real URL, and
-            # DTV's own handler for this exact shape (directv_login()) is a
-            # separate hand-rolled SCRIPTED form-parser the browser loop
-            # never calls. A real fix has the browser loop navigate straight
-            # to this response's own URL instead — the JS onload fires
-            # naturally in a real browser. Logged with the raw body so a
-            # future fix doesn't need to re-diagnose this from scratch.
+        if not mso_login_url and mso_id != 'DTV' and not allow_empty_redirect:
             logger.warning(
                 '[amcn-tve] no MVPD redirect for mso_id=%s: HTTP %d final_url=%s body[:300]=%r',
                 mso_id, r.status_code, r.url, r.text[:300],
@@ -716,10 +714,15 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
             timeout=30,
         )
         profile.raise_for_status()
-        mso_profile = ((profile.json().get('profiles') or {}).get(mso_id) or {})
+        profile_json = profile.json()
+        mso_profile = ((profile_json.get('profiles') or {}).get(mso_id) or {})
         attrs = mso_profile.get('attributes') or {}
         adobe_id = (((attrs.get('userID') or {}).get('value')) or '').strip()
         if not adobe_id:
+            logger.warning(
+                '[amcn-tve] profile lookup for mso_id=%s: available profile keys=%s full_response=%r',
+                mso_id, list((profile_json.get('profiles') or {}).keys()), profile_json,
+            )
             raise TVEAuthError(f'{channel.name}: Adobe profile did not include a {mso_id} userID.')
 
         decision = session.post(

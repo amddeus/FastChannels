@@ -20,6 +20,7 @@ from app.tve.browser_login.common import (
     _maybe_capture_google_master_token,
     _relay_input_and_screenshot,
     _autofill_xfinity_credentials,
+    _try_autofill_credentials,
     _harvest_and_save_xfinity_cookies,
     _is_browser_death,
     _url_for_log,
@@ -140,8 +141,8 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
                 set_status('running', f'Signing in to {channel.name}…')
                 try:
                     statement = scraper._amcn_software_statement(channel, account)
-                    client, code, mso_login_url, auth_headers, _resp = scraper._adobe_session_redirect(
-                        channel, statement, device_id, mso_id,
+                    client, code, mso_login_url, auth_headers, mso_login_response = scraper._adobe_session_redirect(
+                        channel, statement, device_id, mso_id, allow_empty_redirect=True,
                     )
                 except TVENotAuthorizedError:
                     failed.append(f'{channel.name}: not a participating provider')
@@ -180,7 +181,19 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
                                 pass
                             _relay_input_and_screenshot(page, r)
                     else:
-                        page.goto(mso_login_url, wait_until='domcontentloaded', timeout=30000)
+                        # mso_login_url is '' for Spectrum (confirmed live
+                        # 2026-09-18) — Adobe's session endpoint answers with
+                        # a 200 auto-submit SAML form (onload="document.
+                        # forms[0].submit()") instead of a real 3xx, same
+                        # shape DTV's own scripted handler already deals
+                        # with separately. A real browser navigating to that
+                        # SAME URL executes the onload JS itself and submits
+                        # the form naturally, continuing the SSO chain with
+                        # no special-casing needed beyond picking the URL.
+                        page.goto(
+                            mso_login_url or mso_login_response.url,
+                            wait_until='domcontentloaded', timeout=30000,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     if _is_browser_death(exc):
                         raise
@@ -232,6 +245,22 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
                     _autofill_xfinity_credentials(
                         page, account.username, account.password, r=r,
                         stop_key=MVPD_BROWSER_LOGIN_STOP_KEY, input_key=MVPD_BROWSER_LOGIN_INPUT_KEY,
+                    )
+                elif account.username and account.password and mso_id != 'YouTubeTV':
+                    # Every other generic MSO (Spectrum included) needs the
+                    # same credential-form autofill mvpd.py/nbc.py/fox.py
+                    # already do — confirmed live 2026-09-18 this was simply
+                    # missing here: Spectrum landed cleanly on a real
+                    # credential form (once _adobe_session_redirect's
+                    # allow_empty_redirect let the browser reach it at all)
+                    # and then just sat on an empty password field forever,
+                    # since nothing ever typed into it. YouTubeTV's own
+                    # Google flow is excluded — it has its own dedicated
+                    # account-chooser handling instead of a password form.
+                    _try_autofill_credentials(
+                        page, account.username, account.password, r=r,
+                        stop_key=MVPD_BROWSER_LOGIN_STOP_KEY, input_key=MVPD_BROWSER_LOGIN_INPUT_KEY,
+                        navigation_already_settled=True,
                     )
                 set_status('running', f'Signing in to {channel.name}…', landing_url)
 
