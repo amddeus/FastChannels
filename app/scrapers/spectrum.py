@@ -15,6 +15,17 @@ call, not from any request/response body (confirmed live 2026-09-17).
 It's cached per-channel (stream_cache), same shape as Fubo's dash_cache,
 since it's minted per stream, not once per account.
 
+Spectrum caps concurrent stream sessions ("aegis" sessions) at 3 per account
+regardless of client. resolve() never releases the channel it's currently
+serving (a real concurrent viewer on another device might still be using
+it), but every distinct channel change mints a brand-new one — so
+channel-surfing alone can exhaust the cap well inside the 5min cache TTL
+(confirmed live 2026-09-17). _evict_lru_sessions keeps at most
+_MAX_TRACKED_SESSIONS other channels' sessions open, releasing the
+least-recently-minted ones first; _evict_cache_entry also releases a
+channel's own session the moment its cache entry expires, rather than
+silently minting a second one on the next resolve() for the same channel.
+
 The ~12h access token is refreshed silently via the OAuth refresh_token grant
 (_refresh_session, confirmed live 2026-09-17) whenever it's within
 _TOKEN_REFRESH_BUFFER of expiring — no browser/recaptcha needed for that. The
@@ -101,6 +112,7 @@ _MUSIC_CHOICE_NAMES: dict[int, str] = {
 _EPG_HOURS_PER_CALL = 6
 _EPG_BLOCKS = 8  # 8 * 6h = 48h of guide data per scrape
 _STREAM_CACHE_TTL = 5 * 60  # aegisTokenRefreshSeconds was 300 on every mint seen live — match it
+_MAX_TRACKED_SESSIONS = 2  # self-imposed, one under Spectrum's real 3-session AegisTooManySessions cap
 
 
 class SpectrumScraper(BaseScraper):
@@ -403,8 +415,9 @@ class SpectrumScraper(BaseScraper):
         cached = self._cached_stream(cid)
         if cached:
             return cached['manifest_url']
-        manifest_url, ast, stream_session_id, _aegis_token = self._mint_stream(cid)
-        self._cache_stream(cid, manifest_url, ast, stream_session_id)
+        self._evict_lru_sessions(cid)
+        manifest_url, ast, stream_session_id, aegis_token = self._mint_stream(cid)
+        self._cache_stream(cid, manifest_url, ast, stream_session_id, aegis_token)
         return manifest_url
 
     def audit_resolve(self, raw_url: str) -> str:
@@ -417,8 +430,10 @@ class SpectrumScraper(BaseScraper):
         with 429 and the whole audit aborts around ~20 consecutive errors).
         Release the session immediately after minting since the audit only
         needs the manifest once — this is audit-only (see run_stream_audit's
-        audit_resolve preference) so normal resolve()/play() never releases a
-        session a real, possibly-concurrent viewer might still be using."""
+        audit_resolve preference); ordinary resolve()/play() only ever
+        releases a session opportunistically, via _evict_lru_sessions'
+        least-recently-minted eviction, never the channel actually being
+        resolved for the current request."""
         self._ensure_session()
         cid = raw_url.removeprefix('spectrum://')
         manifest_url, ast, stream_session_id, aegis_token = self._mint_stream(cid)
@@ -442,16 +457,53 @@ class SpectrumScraper(BaseScraper):
         if not entry or not entry.get('manifest_url'):
             return None
         if (time.time() - float(entry.get('cached_at', 0))) >= _STREAM_CACHE_TTL:
-            self._stream_cache.pop(cid, None)
-            self._update_cache('stream_cache', self._stream_cache)
+            self._evict_cache_entry(cid, entry)
             return None
         return entry
 
-    def _cache_stream(self, cid: str, manifest_url: str, ast: str | None, stream_session_id: str) -> None:
+    def _evict_cache_entry(self, cid: str, entry: dict) -> None:
+        """Pops a cache entry and, if it's still holding an aegis session
+        Spectrum thinks is open, releases it. Without this, a channel that's
+        genuinely still being watched past the 5min cache TTL (matches
+        aegisTokenRefreshSeconds, confirmed live 2026-09-17) would silently
+        mint a second session on the next resolve() call instead of reusing
+        one — eating a slot in the account's hard 3-concurrent cap for the
+        exact same channel."""
+        self._stream_cache.pop(cid, None)
+        self._update_cache('stream_cache', self._stream_cache)
+        aegis_token = entry.get('aegis_token')
+        if aegis_token:
+            self._release_aegis(aegis_token)
+
+    def _evict_lru_sessions(self, exclude_cid: str) -> None:
+        """Channel-surfing mints a brand-new aegis session on every distinct
+        channel — resolve() deliberately never releases the PREVIOUS
+        channel's session on its own (it might still have a real concurrent
+        viewer on another device), but confirmed live 2026-09-17 that alone
+        is enough to exhaust the account's hard 3-session cap within a
+        handful of channel changes, well inside the 5min TTL that would
+        otherwise self-heal it (see _evict_cache_entry). Keep at most
+        _MAX_TRACKED_SESSIONS other channels' sessions open, releasing the
+        least-recently-minted ones first, before minting one more.
+        Self-imposed and one below Spectrum's real cap on purpose — leaves
+        headroom instead of racing it exactly."""
+        open_entries = [
+            (cid, e) for cid, e in self._stream_cache.items()
+            if cid != exclude_cid and e.get('aegis_token')
+        ]
+        if len(open_entries) < _MAX_TRACKED_SESSIONS:
+            return
+        open_entries.sort(key=lambda kv: kv[1].get('cached_at', 0))
+        for stale_cid, entry in open_entries[:len(open_entries) - _MAX_TRACKED_SESSIONS + 1]:
+            self._evict_cache_entry(stale_cid, entry)
+
+    def _cache_stream(self, cid: str, manifest_url: str, ast: str | None,
+                       stream_session_id: str, aegis_token: str | None = None) -> None:
         self._stream_cache[cid] = {
             'manifest_url': manifest_url,
             'ast': ast,
             'stream_session_id': stream_session_id,
+            'aegis_token': aegis_token,
             'cached_at': time.time(),
         }
         self._update_cache('stream_cache', self._stream_cache)
