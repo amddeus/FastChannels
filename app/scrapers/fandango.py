@@ -50,9 +50,9 @@ class FandangoScraper(BaseScraper):
         r'"(?:title|name|eventName|matchTitle|programName|label)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
         re.IGNORECASE,
     )
-    _SCRIPT_JSON_RE = re.compile(r'<script[^>]*>(.*?)</script>', re.IGNORECASE | re.DOTALL)
+    _SCRIPT_JSON_RE = re.compile(r'<script[^>]*>(.*?)</script\s*>', re.IGNORECASE | re.DOTALL)
     _NEXT_DATA_RE = re.compile(
-        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script\s*>',
         re.IGNORECASE | re.DOTALL,
     )
     _WINDOW_JSON_RE = re.compile(
