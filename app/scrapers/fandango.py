@@ -5,6 +5,7 @@ import logging
 import re
 from dataclasses import dataclass
 from html import unescape
+from html.parser import HTMLParser
 from urllib.parse import unquote
 
 from .base import BaseScraper, ChannelData, ProgramData
@@ -17,6 +18,34 @@ class _FandangoCandidate:
     channel_id: str
     name: str
     stream_url: str
+
+
+class _ScriptCollector(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.scripts: list[tuple[dict[str, str], str]] = []
+        self._in_script = False
+        self._attrs: dict[str, str] = {}
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != 'script':
+            return
+        self._in_script = True
+        self._attrs = {k.lower(): (v or '') for k, v in attrs}
+        self._parts = []
+
+    def handle_data(self, data):
+        if self._in_script:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() != 'script' or not self._in_script:
+            return
+        self.scripts.append((self._attrs, ''.join(self._parts)))
+        self._in_script = False
+        self._attrs = {}
+        self._parts = []
 
 
 class FandangoScraper(BaseScraper):
@@ -49,11 +78,6 @@ class FandangoScraper(BaseScraper):
     _TITLE_RE = re.compile(
         r'"(?:title|name|eventName|matchTitle|programName|label)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
         re.IGNORECASE,
-    )
-    _SCRIPT_JSON_RE = re.compile(r'<script[^>]*>(.*?)</script\s*>', re.IGNORECASE | re.DOTALL)
-    _NEXT_DATA_RE = re.compile(
-        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script\s*>',
-        re.IGNORECASE | re.DOTALL,
     )
     _WINDOW_JSON_RE = re.compile(
         r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});',
@@ -198,23 +222,33 @@ class FandangoScraper(BaseScraper):
     def _extract_json_payloads(self, html: str) -> list[object]:
         payloads: list[object] = []
 
-        for m in self._NEXT_DATA_RE.finditer(html):
-            obj = self._safe_json_loads(m.group(1))
-            if obj is not None:
-                payloads.append(obj)
+        parser = _ScriptCollector()
+        try:
+            parser.feed(html)
+        except Exception:
+            logger.debug('[%s] script parsing failed', self.source_name, exc_info=True)
 
         for m in self._WINDOW_JSON_RE.finditer(html):
             obj = self._safe_json_loads(m.group(1))
             if obj is not None:
                 payloads.append(obj)
 
-        for m in self._SCRIPT_JSON_RE.finditer(html):
-            block = (m.group(1) or '').strip()
+        for attrs, body in parser.scripts:
+            block = (body or '').strip()
             if not block:
                 continue
-            lowered = block.lower()
-            if 'bundesliga' not in lowered and 'vos360' not in lowered and 'm3u8' not in lowered:
+
+            if (attrs.get('id') or '').strip().lower() == '__next_data__':
+                obj = self._safe_json_loads(block)
+                if obj is not None:
+                    payloads.append(obj)
                 continue
+
+            type_attr = (attrs.get('type') or '').strip().lower()
+            lowered = block.lower()
+            if type_attr != 'application/json':
+                if 'bundesliga' not in lowered and 'vos360' not in lowered and 'm3u8' not in lowered:
+                    continue
             obj = self._safe_json_loads(block)
             if obj is not None:
                 payloads.append(obj)
