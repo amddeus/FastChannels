@@ -1,6 +1,6 @@
 # FastChannels
 
-FAST channel aggregator — scrapes Pluto TV, Tubi, Roku, Samsung TV Plus, Sling Freestream, Plex, Xumo, LG Channels, Local Now, STIRR, FreeLiveSports, Bally Sports, Hallmark, TCL TV+, Vidaa Free TV, Vizio WatchFree+, Whale TV+, Adult Swim, Frndly TV, FreeCast, Fubo TV, DirecTV Stream, Cox Contour, Philo, PBS, C-SPAN, cable-network channels via TV Everywhere (NBCUniversal, FOX, FOX One, Discovery, AMC Networks, A+E Networks, Warner Bros Discovery), your own HDHomeRun tuner, and more, then outputs M3U playlists and XMLTV EPG guides for use in any IPTV player (Jellyfin, Plex, Channels DVR, TiviMate, etc.). DRM-protected sources play back through a real Widevine bridge (browser-based PrismCast, or FastChannels' own Fire TV / Android TV player app) rather than being dropped.
+FAST channel aggregator — scrapes Pluto TV, Tubi, Roku, Samsung TV Plus, Sling Freestream, Plex, Xumo, LG Channels, Local Now, STIRR, FreeLiveSports, Fandango Bundesliga, Bally Sports, Hallmark, TCL TV+, Vidaa Free TV, Vizio WatchFree+, Whale TV+, Adult Swim, Frndly TV, FreeCast, Fubo TV, DirecTV Stream, Cox Contour, Philo, PBS, C-SPAN, cable-network channels via TV Everywhere (NBCUniversal, FOX, FOX One, Discovery, AMC Networks, A+E Networks, Warner Bros Discovery), your own HDHomeRun tuner, and more, then outputs M3U playlists and XMLTV EPG guides for use in any IPTV player (Jellyfin, Plex, Channels DVR, TiviMate, etc.). DRM-protected sources play back through a real Widevine bridge (browser-based PrismCast, or FastChannels' own Fire TV / Android TV player app) rather than being dropped.
 
 ## Deploy with Portainer
 
@@ -274,6 +274,7 @@ Disabling a source deletes all its channels from the DB. Re-enabling and running
 | Local Now | None | **Default off.** Public API |
 | STIRR | None | Public API |
 | FreeLiveSports | None | Public API |
+| Fandango Bundesliga | None | Free live Bundesliga streams; playback resolves a fresh tokenized `vos360.video` HLS URL at tune time |
 | Vizio WatchFree+ | None | Public API; clear HLS |
 | Whale TV+ | None | Public API |
 | Adult Swim | None | 24/7 marathon streams |
